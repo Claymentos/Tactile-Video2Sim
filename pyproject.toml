@@ -1,0 +1,29 @@
+[project]
+name = "tactile-video2sim"
+version = "0.1.0"
+description = "Bimanual tactile-guided RL on HumanTouch: DexTaG and Benchmark-Genesis (rl_recon) methods in Genesis"
+requires-python = ">=3.10"
+dependencies = [
+  "genesis-world",
+  "numpy",
+  "scipy",
+  "torch",
+  "trimesh",
+  "pydantic>=2",
+  "pyyaml",
+]
+
+[project.optional-dependencies]
+data = ["pandas", "pyarrow"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tv2s_data", "src/tv2s_env", "src/tv2s_agent"]
+
+[tool.ruff]
+line-length = 110
+src = ["src"]
+target-version = "py310"
