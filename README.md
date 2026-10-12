@@ -97,6 +97,23 @@ launch/compare_tactile_mappings.sh       # policy-free: geometry, replay agreeme
 launch/compare_methods.sh study          # method x mapping: 4 trainings, one summary table
 ```
 
+## Jean Zay: the study with wandb and rollout videos
+
+```bash
+launch/prepare_humantouch.sh 1-20                       # data in $SCRATCH/HumanTouch/X001 (launch/config.sh)
+nohup launch/wandb_sync_loop.sh > logs/wandb_sync.log 2>&1 &   # login node: uploads the offline runs
+launch/submit_study.sh smoke s0                         # 4 short jobs on the dev QoS: checks the pipeline
+launch/submit_study.sh full study1                      # DexTaG/rl_recon x layout/anatomical, one H100 each
+```
+
+Each job (`launch/slurm/train_eval.slurm`) trains with wandb (`TV2S_WANDB=1`, offline: compute nodes have
+no internet), renders rollout videos of fixed clips from the checkpoints as they appear
+(`scripts/policy/render_rollouts.py`: 3D view with the reference hands as orange ghosts, simulated vs
+real glove images), resumes after the 20 h limit, then evaluates and logs the evaluation
+(`scripts/policy/wandb_report.py eval`). A last job logs the method x mapping comparison run
+(`wandb_report.py compare`); `wandb_report.py mapping outputs/tactile_comparison` logs the policy-free
+mapping comparison. Runs of one study share a wandb group (the prefix).
+
 ## Limits worth knowing
 
 - The objects are proxies (cylinders inferred from the glove and the retargeted hand), not the real

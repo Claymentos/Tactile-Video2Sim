@@ -249,14 +249,14 @@ def latest_run_dir(exp_dir: Path) -> Path:
 
 
 def create_env(env_args: Any, num_envs: int, device: str = "cuda", eval_mode: bool = False,
-               show_viewer: bool = False) -> Any:
+               show_viewer: bool = False, render: dict | None = None) -> Any:
     import genesis as gs
     if not gs._initialized:  # noqa: SLF001
         gs.init(backend=gs.gpu if device == "cuda" else gs.cpu, precision="32", logging_level="warning",
                 seed=env_args.seed, performance_mode=True)
     import tv2s_env.sim.envs as envs
     return getattr(envs, env_args.env_name)(env_args, num_envs=num_envs, show_viewer=show_viewer,
-                                            device=torch.device(device), eval_mode=eval_mode)
+                                            device=torch.device(device), eval_mode=eval_mode, render=render)
 
 
 @torch.no_grad()
@@ -383,7 +383,18 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
     save_config(runner_args, run_dir / "configs" / "runner_args.json")
     print(f"Run directory: {run_dir}")
     runner = OnPolicyRunner(ppo, runner_args, run_dir)
-    summary = runner.train(MetricLogger(run_dir), start_iteration=start)
+    mapping = env_args.tactile.mapping
+    wandb_init = dict(name=exp_name, group=os.environ.get("WANDB_RUN_GROUP") or None,
+                      job_type="train", tags=[method, mapping, env_name],
+                      config=dict(method=method, mapping=mapping, env_name=env_name, num_envs=num_envs,
+                                  env=json.loads(env_args.model_dump_json()), algo=json.loads(algo.model_dump_json()),
+                                  runner=json.loads(runner_args.model_dump_json())))
+    logger = MetricLogger(run_dir, wandb_init)
+    try:
+        summary = runner.train(logger, start_iteration=start)
+    finally:
+        logger.finish()
+    (run_dir / "TRAINING_DONE").touch()
     print(f"Training done: {summary['iterations']} iterations in {summary['total_time'] / 60:.1f} min")
 
 

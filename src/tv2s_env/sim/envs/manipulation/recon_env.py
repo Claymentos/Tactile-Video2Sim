@@ -27,12 +27,13 @@ class ReconBimanualEnv(BimanualTactileEnv):
     _args: ReconEnvArgs
 
     def __init__(self, args: ReconEnvArgs, num_envs: int, show_viewer: bool = False,
-                 device: torch.device = torch.device("cuda"), eval_mode: bool = False) -> None:
+                 device: torch.device = torch.device("cuda"), eval_mode: bool = False,
+                 render: dict | None = None) -> None:
         self.assist_scale = 0.0
         self.random_start = not eval_mode
         self.disable_termination = False
         self.in_hand_start = False
-        super().__init__(args, num_envs, show_viewer, device, eval_mode)
+        super().__init__(args, num_envs, show_viewer, device, eval_mode, render)
 
     def _init_buffers(self) -> None:
         super()._init_buffers()

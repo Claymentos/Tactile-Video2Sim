@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 logs/
 deploy/
-data/
+/data/
 outputs/
 *.egg-info/
 assets/tactile/*.png

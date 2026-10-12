@@ -71,10 +71,12 @@ def balanced_assignment(n_variants: int, n_envs: int) -> np.ndarray:
 
 class BimanualTactileEnv(BaseEnv):
     def __init__(self, args: BimanualEnvArgs, num_envs: int, show_viewer: bool = False,
-                 device: torch.device = torch.device("cuda"), eval_mode: bool = False) -> None:
+                 device: torch.device = torch.device("cuda"), eval_mode: bool = False,
+                 render: dict | None = None) -> None:
         super().__init__(device=device)
         self._args = args
         self._eval_mode = eval_mode
+        self._render = render     # None, or {"res": (w, h)}: one camera per env + reference ghost hands
         self._num_envs = num_envs
         self.generator = torch.Generator(device=device).manual_seed(args.seed)
         if not gs._initialized:  # noqa: SLF001
@@ -197,7 +199,10 @@ class BimanualTactileEnv(BaseEnv):
             rigid_options=gs.options.RigidOptions(enable_self_collision=False, enable_joint_limit=True,
                                                   constraint_solver=gs.constraint_solver.Newton,
                                                   max_collision_pairs=200),
-            vis_options=gs.options.VisOptions(show_world_frame=False, plane_reflection=False),
+            vis_options=gs.options.VisOptions(show_world_frame=False, plane_reflection=False,
+                                              **(dict(shadow=False, ambient_light=(0.45, 0.45, 0.45),
+                                                      background_color=(0.85, 0.88, 0.92))
+                                                 if self._render is not None else {})),
             show_viewer=show_viewer,
         )
         self.scene.add_entity(gs.morphs.Plane())
@@ -215,7 +220,11 @@ class BimanualTactileEnv(BaseEnv):
                 material=gs.materials.Rigid(rho=500.0, friction=a.objects.friction),
                 surface=gs.surfaces.Default(color=(0.75, 0.45, 0.85) if h == 0 else (0.45, 0.75, 0.55)),
             ))
-        self.scene.build(n_envs=self._num_envs, env_spacing=(1.0, 1.0))
+        if self._render is not None:
+            self._add_render_entities()
+        # videos: envs far apart, so that a camera only sees its own env's hands and objects
+        spacing = (3.0, 3.0) if self._render is not None else (1.0, 1.0)
+        self.scene.build(n_envs=self._num_envs, env_spacing=spacing)
         for hand in self.hands:
             hand.post_build(self._num_envs)
             if not self._eval_mode:
@@ -245,6 +254,52 @@ class BimanualTactileEnv(BaseEnv):
             pos = torch.stack([rest[:, h, 0], rest[:, h, 1], self.support_z_t[:, h] - sz / 2], -1)
             parked = torch.tensor([0.0, 3.0 + h, -1.0], device=dev)
             sup.set_pos(torch.where(self.obj_active_t[:, h:h + 1], pos, parked), envs_idx=envs)
+
+    # ================================================================== rendering (videos only)
+    def _add_render_entities(self) -> None:
+        """One camera per env, and per hand a non-colliding translucent copy of the hand that is put on the
+        reference pose before each render (the 'ghost'). Only for small eval envs (videos)."""
+        res = tuple(self._render.get("res", (480, 360)))
+        # a single camera moved over every env (envs are 3 m apart, see _build_scene): per-env cameras
+        # (env_idx) rendered some envs black in Genesis 1.3.3
+        self.camera = self.scene.add_camera(res=res, pos=(0.5, -0.5, 0.5), lookat=(0.0, 0.0, 0.0), fov=45,
+                                            env_idx=0, GUI=False)
+        self.ghosts = []
+        for h, s in enumerate(SIDES):
+            hand = self.hands[h]
+            urdf = hand.model.write_floating_urdf(str(Path(self._args.work_dir) / f"wuji_{s}_ghost.urdf"),
+                                                  self.base_R0[s], base_mass=0.01)
+            self.ghosts.append(self.scene.add_entity(
+                gs.morphs.URDF(file=urdf, fixed=True, merge_fixed_links=True, collision=False),
+                material=gs.materials.Rigid(gravity_compensation=1.0),
+                surface=gs.surfaces.Default(color=(1.0, 0.45, 0.0, 0.45)),
+            ))
+
+    @torch.no_grad()
+    def render_frames(self) -> np.ndarray:
+        """(B, h, w, 3) uint8: every env's camera, looking at its hands, the ghosts on the reference."""
+        from tv2s_env.robots.wuji_model import BASE_JOINTS
+        envs = torch.arange(self._num_envs, device=self.device)
+        t = torch.minimum(self.t, self.lengths_t[self.env_clip] - 1)
+        for h, ghost in enumerate(self.ghosts):
+            if not hasattr(self, "_ghost_dofs"):
+                self._ghost_dofs = [[g.get_joint(n).dofs_idx_local[0] for n in BASE_JOINTS + self.hands[i].model.dof_names]
+                                    for i, g in enumerate(self.ghosts)]
+            q = torch.cat([self.ref["base_q"][self.env_clip, t, h], self.ref["dof_pos"][self.env_clip, t, h]], -1)
+            ghost.set_dofs_position(q, self._ghost_dofs[h], envs_idx=envs, zero_velocity=True)
+        palms = self.base_pos.cpu().numpy()                                            # (B, H, 3)
+        centre = palms.mean(1)
+        spread = np.linalg.norm(palms[:, 0] - palms[:, 1], axis=-1)                    # frame both hands
+        view = np.array([0.0, -0.85, 0.53])
+        offsets = np.asarray(self.scene.envs_offset)
+        offsets = offsets - offsets[0]                     # the camera's poses are relative to env 0
+        frames = []
+        for i in range(self._num_envs):
+            c = centre[i] + offsets[i]
+            self.camera.set_pose(pos=c + view * (0.45 + 1.1 * spread[i]), lookat=c)
+            rgb = self.camera.render(rgb=True, force_render=True)[0]
+            frames.append(np.asarray(rgb.cpu() if torch.is_tensor(rgb) else rgb))
+        return np.stack(frames)
 
     def _build_sensors(self) -> None:
         t = self._args.tactile

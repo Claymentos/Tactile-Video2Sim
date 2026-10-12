@@ -35,8 +35,9 @@ class DexTaGBimanualEnv(BimanualTactileEnv):
     _args: DexTaGEnvArgs
 
     def __init__(self, args: DexTaGEnvArgs, num_envs: int, show_viewer: bool = False,
-                 device: torch.device = torch.device("cuda"), eval_mode: bool = False) -> None:
-        super().__init__(args, num_envs, show_viewer, device, eval_mode)
+                 device: torch.device = torch.device("cuda"), eval_mode: bool = False,
+                 render: dict | None = None) -> None:
+        super().__init__(args, num_envs, show_viewer, device, eval_mode, render)
 
     # ------------------------------------------------------------------ buffers
     def _init_buffers(self) -> None:

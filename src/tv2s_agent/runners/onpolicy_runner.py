@@ -1,7 +1,10 @@
 """On-policy training loop with logging and periodic checkpoints (DexTaG's gs_agent/runners/onpolicy_runner.py)."""
 
 import csv
+import json
+import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -9,9 +12,13 @@ from tv2s_agent.runners.config.schema import RunnerArgs
 
 
 class MetricLogger:
-    """stdout summary + one CSV row per logged iteration + TensorBoard (if installed)."""
+    """stdout summary + one CSV row per logged iteration + TensorBoard (if installed) + wandb (TV2S_WANDB=1).
 
-    def __init__(self, folder: Path) -> None:
+    wandb: project $WANDB_PROJECT (default tactile-video2sim), group $WANDB_RUN_GROUP, run name = experiment.
+    The run id is kept in logs/<exp>/wandb_id so that a resumed training continues the same wandb run.
+    Rollout videos written by scripts/policy/render_rollouts.py into <run>/videos are uploaded as they appear."""
+
+    def __init__(self, folder: Path, wandb_init: dict | None = None) -> None:
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         self._csv_path = self.folder / "progress.csv"
@@ -21,8 +28,53 @@ class MetricLogger:
             self._tb = SummaryWriter(str(self.folder / "tb"))
         except ImportError:
             self._tb = None
+        self._wandb = None
+        self._videos_logged: set[str] = set()
+        self._env_steps = 0
+        self._tic = time.time()
+        if wandb_init is not None and os.environ.get("TV2S_WANDB", "0") == "1":
+            import wandb
+
+            id_file = self.folder.parent / "wandb_id"
+            run_id = id_file.read_text().strip() if id_file.exists() else uuid.uuid4().hex[:8]
+            id_file.write_text(run_id)
+            self._wandb = wandb.init(project=os.environ.get("WANDB_PROJECT", "tactile-video2sim"), id=run_id,
+                                     resume="allow", dir=str(self.folder), **wandb_init)
+            self._wandb.define_metric("iteration")
+            self._wandb.define_metric("*", step_metric="iteration")
+            (self.folder / "wandb_run.json").write_text(json.dumps(dict(id=run_id, project=self._wandb.project)))
+
+    def _new_videos(self) -> dict[str, Any]:
+        import wandb
+
+        out = {}
+        for mp4 in sorted((self.folder / "videos").glob("rollout_*.mp4")):
+            if mp4.name in self._videos_logged or mp4.name.endswith(".tmp.mp4"):
+                continue
+            self._videos_logged.add(mp4.name)
+            meta_path = mp4.with_suffix(".json")
+            caption = mp4.stem
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+                caption = f"{meta['checkpoint']}: " + ", ".join(
+                    f"{c['clip']} F1 {c['tac_f1']:.2f}{' ok' if c['success'] else ''}" for c in meta["clips"])
+                out["video_clips/mean_tac_f1"] = sum(c["tac_f1"] for c in meta["clips"]) / len(meta["clips"])
+                out["video_clips/success"] = sum(c["success"] for c in meta["clips"]) / len(meta["clips"])
+            out["rollout_video"] = wandb.Video(str(mp4), caption=caption, format="mp4")
+        return out
+
+    def finish(self) -> None:
+        if self._wandb is not None:
+            extra = self._new_videos()
+            if extra:
+                self._wandb.log(extra)
+            self._wandb.finish()
 
     def dump(self, step: int, metrics: dict[str, float]) -> None:
+        self._env_steps += int(metrics.get("speed/rollout_step", 0)) * max(1, int(metrics.pop("_iterations_since_log", 1)))
+        if self._wandb is not None:
+            self._wandb.log({"iteration": step, "progress/env_steps": self._env_steps,
+                             "progress/wall_hours": (time.time() - self._tic) / 3600, **metrics, **self._new_videos()})
         row = {"iteration": step, **metrics}
         if self._fields is None:
             self._fields = list(row)
@@ -50,11 +102,14 @@ class OnPolicyRunner:
         env = self.algorithm.env
         total = self.args.total_iterations
         tic = time.time()
+        last_log = start_iteration - 1
         for it in range(start_iteration, total):
             env.set_training_progress(it, total)
             info = self.algorithm.train_one_iteration()
             if it % self.args.log_interval == 0 or it == total - 1:
                 flat = flatten(info)
+                flat["_iterations_since_log"] = it - last_log
+                last_log = it
                 logger.dump(it, flat)
                 m, r = info["metrics"], info["rollout"]
                 print(f"it {it:6d} | reward {r['mean_reward']:8.3f} len {r['mean_length']:6.1f} | "
