@@ -43,7 +43,7 @@ for e in select_episodes('$EGOTOUCH_ROOT', '$EPISODES' or None):
         out="$OUT/scene/$key.json"
         if [ -e "$out" ]; then echo "  $key: exists"; continue; fi
         "$PY_GEMINI" scripts/reconstruction/semantic_parsing.py --video "$video" --out "$out" \
-            --model "${MODEL:-gemini-3.6-flash}" --fps "${GEMINI_FPS:-4}" --context "$ctx" || echo "  $key: parsing failed"
+            --model "${MODEL:-gemini-3.6-flash}" --fps "${GEMINI_FPS:-4}" --context "$ctx" < /dev/null || echo "  $key: parsing failed"
     done
 fi
 echo "=== 5/6 cuts + videos ==="

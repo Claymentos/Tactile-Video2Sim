@@ -87,9 +87,15 @@ if [ "${SKIP_RECGEN:-0}" != "1" ]; then
         2>&1 | grep --line-buffered -v "$QUIET"
 fi
 if [ "${SKIP_TRACK:-0}" != "1" ]; then
-    echo "=== 6/8 FoundationPose trajectories ==="
-    "$PY_FP" scripts/reconstruction/track_objects_foundationpose.py --perception "$P" "${OBJ[@]}" 2>&1 \
-        | grep --line-buffered "agreement\|tracked\|Error\|Traceback"
+    if [ -x "$PY_FP" ]; then
+        echo "=== 6/8 FoundationPose trajectories ==="
+        "$PY_FP" scripts/reconstruction/track_objects_foundationpose.py --perception "$P" "${OBJ[@]}" 2>&1 \
+            | grep --line-buffered "agreement\|tracked\|Error\|Traceback"
+    else
+        echo "=== 6/8 object models only (no FoundationPose env: $PY_FP) ==="
+        "$PY_RECGEN" scripts/reconstruction/track_objects_foundationpose.py --perception "$P" "${OBJ[@]}" --models-only 2>&1 \
+            | grep --line-buffered -v "$QUIET"
+    fi
     # the scene's trajectories (assemble_scene.py --trajectories cotracker, the default): Benchmark-Genesis'
     # CoTracker + depth, seeded on the RecGen frame (needs the models written by FoundationPose above)
     echo "=== 6/8 CoTracker trajectories ==="
