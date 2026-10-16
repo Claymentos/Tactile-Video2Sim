@@ -20,7 +20,7 @@ import torch
 
 from tv2s_env.common.utils.math_utils import matrix_to_rotvec
 from tv2s_env.sim.envs.config.schema import ReconEnvArgs
-from tv2s_env.sim.envs.manipulation.bimanual_tactile_env import H, BimanualTactileEnv
+from tv2s_env.sim.envs.manipulation.bimanual_tactile_env import BimanualTactileEnv
 
 
 class ReconBimanualEnv(BimanualTactileEnv):
@@ -28,21 +28,21 @@ class ReconBimanualEnv(BimanualTactileEnv):
 
     def __init__(self, args: ReconEnvArgs, num_envs: int, show_viewer: bool = False,
                  device: torch.device = torch.device("cuda"), eval_mode: bool = False,
-                 render: dict | None = None) -> None:
+                 render: dict | None = None, camera_res: tuple[int, int] | None = None) -> None:
         self.assist_scale = 0.0
         self.random_start = not eval_mode
         self.disable_termination = False
         self.in_hand_start = False
-        super().__init__(args, num_envs, show_viewer, device, eval_mode, render)
+        super().__init__(args, num_envs, show_viewer, device, eval_mode, render, camera_res)
 
     def _init_buffers(self) -> None:
         super()._init_buffers()
         a, dev = self._args, self.device
-        self.action_dim = H * 26
+        self.action_dim = self.H * 26
         self.last_action = torch.zeros(self._num_envs, self.action_dim, device=dev)
         self.action_rate = torch.zeros(self._num_envs, device=dev)
         self.action_scale = torch.tensor([a.action_scale_pos] * 3 + [a.action_scale_rot] * 3
-                                         + [a.action_scale_finger] * 20, device=dev).repeat(H)
+                                         + [a.action_scale_finger] * 20, device=dev).repeat(self.H)
         # first grasp onset of each clip (random starts stop before it), and its grasp frames (RSI)
         g0 = torch.as_tensor(self.grasp[..., 0], device=dev).float()
         g0[~torch.as_tensor(self.obj_active, device=dev)] = float("inf")
@@ -85,13 +85,15 @@ class ReconBimanualEnv(BimanualTactileEnv):
         self.last_action = action.clone()
         t1 = self.t + 1
         ref = torch.cat([self.ref_at("base_q", t1), self.ref_at("dof_pos", t1)], -1)       # (B, H, 26)
-        delta = (action * self.action_scale).reshape(self._num_envs, H, 26)
-        self._physics_step([ref[:, h] + delta[:, h] for h in range(H)])
+        delta = (action * self.action_scale).reshape(self._num_envs, self.H, 26)
+        self._physics_step([ref[:, h] + delta[:, h] for h in range(self.H)])
 
     def _apply_object_aids(self) -> None:
         """Hold each object at its in-palm pose while the reference glove reports the grasp."""
         if self.assist_scale <= 0 or self._eval_mode:
             return
+        if self.episode:
+            return self._assist_episode()
         a, t1 = self._args, self.t + 1
         holding = self.ref_at("holding", t1) & self.obj_active_t                              # (B, H)
         if not holding.any():
@@ -116,6 +118,43 @@ class ReconBimanualEnv(BimanualTactileEnv):
             dw_obj = ((w_des - w)[:, None] @ R)[:, 0]                                          # object frame
             torque = k * (R @ (inertia * dw_obj)[..., None])[..., 0] / self.dt
             self._apply_object_wrench(h, force, torque)
+
+    def _assist_episode(self) -> None:
+        """Episode mode: each hand holds its scheduled object while the reference holds it (the anchored holds of
+        build_episode_clip.py, where the glove reports the grasp), at the object's pose in the reference palm
+        carried onto the simulated palm; the same velocity-level controller as above (rl_recon's _assist)."""
+        a, t1 = self._args, self.t + 1
+        idx = self.ref_at("schedule", t1)                                                     # (B, H)
+        hold = self.ref_at("holding", t1) & (idx >= 0)
+        if not hold.any():
+            return
+        ref_p, ref_R = self.ref_at("wrist_pos", t1), self.ref_at("wrist_rot", t1)              # (B, H, 3), (B, H, 3, 3)
+        obj_p, obj_R = self.ref_at("obj_pos", t1), self.ref_at("obj_rot", t1)
+        anchor_p = (ref_R.transpose(-1, -2) @ (obj_p - ref_p)[..., None])[..., 0]
+        anchor_R = ref_R.transpose(-1, -2) @ obj_R
+        p_target = self.base_pos + (self.base_rot @ anchor_p[..., None])[..., 0]
+        R_target = self.base_rot @ anchor_R
+        solver = self.scene.sim.rigid_solver
+        for k, link in enumerate(self.scene_obj_link):
+            if not bool(self.scene_obj_free[k]):
+                continue
+            sel = hold & (idx == k)                                                           # (B, H)
+            if not sel.any():
+                continue
+            h = sel.float().argmax(-1)                                                        # the hand holding it
+            on = sel.any(-1).float()[:, None]
+            g = lambda x: x[torch.arange(self._num_envs, device=self.device), h]
+            p, v, w = self.all_object_pos[:, k], self.all_object_vel[:, k], self.all_object_ang[:, k]
+            R = self.all_object_rot[:, k]
+            m = self.scene_obj_mass[:, k:k + 1]
+            gain = self.assist_scale * a.assist_gain * on
+            force = gain * m * ((g(p_target) - p) / a.assist_tau - v) / self.dt
+            force[:, 2:] += self.assist_scale * on * m * 9.81
+            w_des = matrix_to_rotvec(g(R_target) @ R.transpose(-1, -2)) / a.assist_tau
+            I_world = R @ (self.scene_obj_inertia[k] * m[..., None]) @ R.transpose(-1, -2)
+            torque = gain * (I_world @ (w_des - w)[..., None])[..., 0] / self.dt
+            solver.apply_links_external_force(force[:, None], [link], ref="link_com")
+            solver.apply_links_external_torque(torque[:, None], [link], ref="link_com")
 
     def set_training_progress(self, iteration: int, total_iterations: int) -> None:
         """The assist decays linearly to 0 over the first `assist_decay` of training (rl_recon/train.py)."""
@@ -162,6 +201,14 @@ class ReconBimanualEnv(BimanualTactileEnv):
         a, n, dev, gen = self._args, len(envs_idx), self.device, self.generator
         clip = self.env_clip[envs_idx]
         start = torch.zeros(n, dtype=torch.long, device=dev)
+        if self.episode:                                  # anywhere in the demonstration, for a window
+            start = self._episode_start(envs_idx)
+            self._reset_hands_and_objects(envs_idx, start, self.ref["holding"][clip, start])
+            self.t[envs_idx], self.start[envs_idx] = start, start
+            self.horizon[envs_idx] = self._episode_horizon(envs_idx, start)
+            self.last_action[envs_idx] = 0.0
+            self.update_buffers()
+            return
         if self.random_start:
             pick = torch.rand(n, device=dev, generator=gen) < a.start_frame_prob
             smax = (self.first_grasp[clip] - 10).clamp(min=0)
@@ -176,7 +223,7 @@ class ReconBimanualEnv(BimanualTactileEnv):
             start = torch.as_tensor(self.grasp[..., 0], device=dev)[clip].masked_fill(
                 ~torch.as_tensor(self.obj_active, device=dev)[clip], 10**6).min(-1).values
             start = start + 3
-        start = torch.minimum(start, self.lengths_t[clip] - 2)
+        start = torch.minimum(torch.maximum(start, self.min_start_t[clip]), self.lengths_t[clip] - 2)
         self._reset_hands_and_objects(envs_idx, start, self.ref["holding"][clip, start])
         self.t[envs_idx] = start
         self.start[envs_idx] = start

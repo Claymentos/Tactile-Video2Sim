@@ -16,6 +16,9 @@ The layout gives region labels only, not which end of a finger patch is the tip.
 
 Raw cells carry a slowly drifting per-cell offset (glove pre-load: ~145 of 460 cells read > 0 with the
 hand open). `clean_tactile` removes a running low-percentile baseline, then thresholds.
+
+Other gloves give their layout as a cell list (`{"grid_shape", "n_raw", "cells": {side: [[channel, row, col,
+region, u, v], ...]}}`, e.g. EgoTouch's, tv2s_data/egotouch.py): `load_glove_layout` reads either format.
 """
 
 import json
@@ -38,14 +41,15 @@ class GloveLayout:
     u: np.ndarray  # (C,) proximal -> distal in [0, 1]
     v: np.ndarray  # (C,) ulnar -> radial in [0, 1]
     n_raw: int = 460
+    grid_shape: tuple[int, int] = GRID_SHAPE
 
     @property
     def n_channels(self) -> int:
         return len(self.channels)
 
     def to_image(self, values: np.ndarray, fill: float = 0.0) -> np.ndarray:
-        """(..., C) channel values -> (..., 23, 20) glove image."""
-        img = np.full(values.shape[:-1] + GRID_SHAPE, fill, dtype=values.dtype)
+        """(..., C) channel values -> (..., rows, cols) glove image (HumanTouch: 23 x 20)."""
+        img = np.full(values.shape[:-1] + tuple(self.grid_shape), fill, dtype=values.dtype)
         img[..., self.rows, self.cols] = values
         return img
 
@@ -55,7 +59,13 @@ class GloveLayout:
 
 def load_glove_layout(mapping_json: str | Path, side: str, finger_tip_row: int = 22) -> GloveLayout:
     with open(mapping_json) as f:
-        sensors = json.load(f)["sensors"]
+        spec = json.load(f)
+    if "cells" in spec:                                   # a cell list: u, v given (finger_tip_row unused)
+        ch, rows, cols, region, u, v = zip(*spec["cells"][side])
+        return GloveLayout(side=side, channels=np.asarray(ch), rows=np.asarray(rows), cols=np.asarray(cols),
+                           region=np.asarray(region), u=np.asarray(u, float), v=np.asarray(v, float),
+                           n_raw=int(spec["n_raw"]), grid_shape=tuple(spec["grid_shape"]))
+    sensors = spec["sensors"]
     ids, rows, cols, region = [], [], [], []
     for s in sensors:
         r = s[f"{side}_region"]

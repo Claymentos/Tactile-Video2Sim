@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 data = ["pandas", "pyarrow"]
+lightning = ["lightning>=2.4", "wandb"]   # the Lightning training variant (--lightning)
 
 [build-system]
 requires = ["hatchling>=1.25"]

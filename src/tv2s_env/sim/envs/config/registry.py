@@ -2,13 +2,17 @@
 
   bimanual_dextag   DexTaG's retargeter: DexTaG's rewards and observations, `layout` glove mapping
   bimanual_recon    Benchmark-Genesis' rl_recon: residual policy, contact-F1 reward, `anatomical` mapping
-The `*_<mapping>` variants swap the glove mapping only, to compare the mappings under one method.
+  rl_recon          Benchmark-Genesis' rl_recon as its env.py, on a per-episode reference.npz
+                    (scripts/rl/prepare_reference.py), the hands the demonstration uses (rl_recon_env.py)
+The `*_<mapping>` variants swap the glove mapping only, to compare the mappings under one method
+(`mano`: glove -> MANO -> Wuji, tactile/mano_mapping.py).
 """
 
 from tv2s_env.sim.envs.config.schema import (
     DexTaGEnvArgs,
     ObjectArgs,
     ReconEnvArgs,
+    RlReconEnvArgs,
     TactileArgs,
 )
 
@@ -108,6 +112,9 @@ EnvArgsRegistry["bimanual_recon"] = ReconEnvArgs(
 )
 
 # mapping swaps, for the method x mapping comparison
-for _name, _mapping in [("bimanual_dextag_anatomical", "anatomical"), ("bimanual_recon_layout", "layout")]:
+for _name, _mapping in [("bimanual_dextag_anatomical", "anatomical"), ("bimanual_recon_layout", "layout"),
+                         ("bimanual_dextag_mano", "mano"), ("bimanual_recon_mano", "mano")]:
     _base = EnvArgsRegistry[_name.rsplit("_", 1)[0]]
     EnvArgsRegistry[_name] = _base.model_copy(update={"tactile": _base.tactile.model_copy(update={"mapping": _mapping})})
+
+EnvArgsRegistry["rl_recon"] = RlReconEnvArgs()

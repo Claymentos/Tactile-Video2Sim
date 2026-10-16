@@ -177,7 +177,7 @@ def main() -> None:
 
     from tv2s_agent.algos.config.schema import PPOArgs
     from tv2s_agent.algos.ppo import PPO
-    from tv2s_env.sim.envs.config.schema import DexTaGEnvArgs, ReconEnvArgs
+    from tv2s_env.sim.envs.config.schema import load_env_args
 
     exp_dir = REPO / "logs" / args.exp_name
     while True:                                        # --watch may start before the first checkpoint
@@ -188,8 +188,7 @@ def main() -> None:
             if not args.watch:
                 raise
             time.sleep(args.poll)
-    env_cls = DexTaGEnvArgs if args.method == "dextag" else ReconEnvArgs
-    env_args = load_config(env_cls, run_dir / "configs" / "env_args.json")
+    env_args = load_env_args(run_dir / "configs" / "env_args.json")
     clips = pick_clips(env_args, args.clips)
     env_args = env_args.model_copy(update={"data": env_args.data.model_copy(update={"clips": clips, "max_clips": 0,
                                                                                      "split_mode": "all"})})

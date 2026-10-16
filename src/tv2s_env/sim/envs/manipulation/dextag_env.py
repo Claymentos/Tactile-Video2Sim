@@ -18,7 +18,7 @@ import torch
 
 from tv2s_env.common.utils.math_utils import axis_angle_between
 from tv2s_env.sim.envs.config.schema import DexTaGEnvArgs
-from tv2s_env.sim.envs.manipulation.bimanual_tactile_env import H, BimanualTactileEnv
+from tv2s_env.sim.envs.manipulation.bimanual_tactile_env import BimanualTactileEnv
 
 # reference terms observed for the current and the future frames (B, H, ...) -> flattened
 MOTION_TERM_KEYS = {
@@ -36,14 +36,14 @@ class DexTaGBimanualEnv(BimanualTactileEnv):
 
     def __init__(self, args: DexTaGEnvArgs, num_envs: int, show_viewer: bool = False,
                  device: torch.device = torch.device("cuda"), eval_mode: bool = False,
-                 render: dict | None = None) -> None:
-        super().__init__(args, num_envs, show_viewer, device, eval_mode, render)
+                 render: dict | None = None, camera_res: tuple[int, int] | None = None) -> None:
+        super().__init__(args, num_envs, show_viewer, device, eval_mode, render, camera_res)
 
     # ------------------------------------------------------------------ buffers
     def _init_buffers(self) -> None:
         super()._init_buffers()
         a, B, dev = self._args, self._num_envs, self.device
-        self.action_dim = H * 26
+        self.action_dim = self.H * 26
         self.action_history_buf = torch.zeros(B, a.obs_history_len, self.action_dim, device=dev)
         scale = [a.base_action_scale_pos] * 3 + [a.base_action_scale_rot] * 3
         self._base_scale = torch.tensor(scale, device=dev)
@@ -85,8 +85,8 @@ class DexTaGBimanualEnv(BimanualTactileEnv):
         n_img = self.tactile_map.shape[-1] * self.tactile_map.shape[-2]
         layout = dict(motion_dim=self.motion_dim if "target_motion" in terms else 0,
                       proprio_dim=self.proprio_dim + (1 if "last_reward" in terms else 0),
-                      tactile_maps=H if a.tactile_map_term in terms else 0,
-                      target_tactile_maps=H if "target_tactile_map" in terms else 0,
+                      tactile_maps=self.H if a.tactile_map_term in terms else 0,
+                      target_tactile_maps=self.H if "target_tactile_map" in terms else 0,
                       tactile_map_h=self.tactile_map.shape[-2], tactile_map_w=self.tactile_map.shape[-1],
                       history_timesteps=a.obs_history_len if "action_proprio_history_flat" in terms else 0,
                       history_per_step_dim=self.action_dim + self.proprio_dim,
@@ -130,7 +130,7 @@ class DexTaGBimanualEnv(BimanualTactileEnv):
         self.action_history_buf = torch.cat([self.action_history_buf[:, 1:], action[:, None]], 1)
         lo, hi = a.action_latency_range
         latency = torch.randint(lo, hi + 1, (B,), device=self.device, generator=self.generator)
-        exec_action = self.action_history_buf[torch.arange(B, device=self.device), -1 - latency].reshape(B, H, 26)
+        exec_action = self.action_history_buf[torch.arange(B, device=self.device), -1 - latency].reshape(B, self.H, 26)
         targets = []
         for h, hand in enumerate(self.hands):
             base = self.base_dof_pos[:, h] + exec_action[:, h, :6] * self._base_scale
@@ -141,7 +141,7 @@ class DexTaGBimanualEnv(BimanualTactileEnv):
 
     def _apply_object_aids(self) -> None:
         a, o = self._args, self._args.objects
-        if self._eval_mode:
+        if self._eval_mode or self.episode:
             return
         t1 = self.t + 1
         if a.object_guide_decay_steps > 0 and self.training_step < a.object_guide_decay_steps:
@@ -160,10 +160,10 @@ class DexTaGBimanualEnv(BimanualTactileEnv):
             ramp = min((self.training_step - c0) / max(c1 - c0, 1), 1.0)
             if not hasattr(self, "_kick_prob"):
                 lo, hi = torch.log(torch.tensor(o.perturbation_prob_range))
-                self._kick_prob = torch.exp(lo + (hi - lo) * torch.rand(self._num_envs, H, device=self.device))
+                self._kick_prob = torch.exp(lo + (hi - lo) * torch.rand(self._num_envs, self.H, device=self.device))
             lifted = self.object_height_above_support > o.perturbation_lift_threshold
-            kick = ((torch.rand(self._num_envs, H, device=self.device) < self._kick_prob) & lifted).float()
-            for h in range(H):
+            kick = ((torch.rand(self._num_envs, self.H, device=self.device) < self._kick_prob) & lifted).float()
+            for h in range(self.H):
                 m = self.obj_mass[:, h:h + 1] * kick[:, h:h + 1] * ramp
                 f = torch.randn(self._num_envs, 3, device=self.device) * m * o.perturbation_force_scale
                 tq = torch.randn(self._num_envs, 3, device=self.device) * m * o.perturbation_torque_scale
@@ -200,8 +200,12 @@ class DexTaGBimanualEnv(BimanualTactileEnv):
     def reset_idx(self, envs_idx: torch.Tensor) -> None:
         if len(envs_idx) == 0:
             return
-        start = torch.zeros(len(envs_idx), dtype=torch.long, device=self.device)
-        self._reset_hands_and_objects(envs_idx, start, torch.zeros(len(envs_idx), H, dtype=torch.bool, device=self.device))
+        clip = self.env_clip[envs_idx]
+        start = self.min_start_t[clip]                      # 0 unless a hand overlaps a resting object there
+        if self.episode:                                    # anywhere in the demonstration, for a window
+            start = self._episode_start(envs_idx)
+            self.horizon[envs_idx] = self._episode_horizon(envs_idx, start)
+        self._reset_hands_and_objects(envs_idx, start, self.ref["holding"][clip, start])
         self.t[envs_idx] = start
         self.start[envs_idx] = start
         self.action_history_buf[envs_idx] = 0.0

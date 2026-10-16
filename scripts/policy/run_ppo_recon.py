@@ -15,6 +15,15 @@ Evaluate every checkpoint and keep the best (model_best.pt), as rl_recon's recon
     python scripts/policy/run_ppo_recon.py --exp_name=recon_v1 --eval --all_checkpoints
 Ablations: no tactile reward: --reward_args.TactileContactF1Reward.scale=0;
     --env.glove_obs=False hides the glove contacts from the policy; --env.assist_init=0 disables the assist.
+
+On a per-episode reference (rl_recon_env.py: Benchmark-Genesis' env.py, one or two hands; launch/rl_recon.sh):
+    python scripts/policy/run_ppo_recon.py --exp_name=screwdriver_v1 --env_name=rl_recon \
+        --env.data.reference=data/references/screwdriver_103227/reference.npz --num_envs=2048 --runner.total_iterations=2000
+    python scripts/policy/eval_rl_recon.py --exp_name=screwdriver_v1 --all
+  ablations: --env.tactile_reward=False (train.py --no-tactile), --env.glove_obs=False (--no-glove-obs);
+  a fine-tune (train.py --resume ... --reset-iterations): --resume_checkpoint=<.pt> --reset_iterations=True
+
+Lightning variant (same PPO, a Lightning Trainer, wandb logged from the LightningModule with TV2S_WANDB=1): --lightning
 """
 
 import sys
@@ -22,16 +31,17 @@ import sys
 from common import evaluate_run, parse_cli, split_overrides, train_policy
 
 MAIN_ARGS = {"exp_name", "env_name", "num_envs", "eval", "checkpoint", "all_checkpoints", "split_mode",
-             "resume_checkpoint", "device"}
+             "resume_checkpoint", "lightning", "reset_iterations", "device"}
 
 
 def main(exp_name: str, env_name: str = "bimanual_recon", num_envs: int = 2048, eval: bool = False,
          checkpoint: str | None = None, all_checkpoints: bool = False, split_mode: str | None = None,
-         resume_checkpoint: str | None = None, device: str = "cuda", overrides: tuple = ({}, {}, {})) -> None:
+         resume_checkpoint: str | None = None, reset_iterations: bool = False, lightning: bool = False, device: str = "cuda",
+         overrides: tuple = ({}, {}, {})) -> None:
     if eval:
         evaluate_run("recon", exp_name, checkpoint, all_checkpoints, split_mode, overrides[0], device)
     else:
-        train_policy("recon", exp_name, env_name, num_envs, overrides, resume_checkpoint, device)
+        train_policy("recon", exp_name, env_name, num_envs, overrides, resume_checkpoint, device, reset_iterations, lightning)
 
 
 if __name__ == "__main__":

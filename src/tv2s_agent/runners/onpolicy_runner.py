@@ -45,23 +45,7 @@ class MetricLogger:
             (self.folder / "wandb_run.json").write_text(json.dumps(dict(id=run_id, project=self._wandb.project)))
 
     def _new_videos(self) -> dict[str, Any]:
-        import wandb
-
-        out = {}
-        for mp4 in sorted((self.folder / "videos").glob("rollout_*.mp4")):
-            if mp4.name in self._videos_logged or mp4.name.endswith(".tmp.mp4"):
-                continue
-            self._videos_logged.add(mp4.name)
-            meta_path = mp4.with_suffix(".json")
-            caption = mp4.stem
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text())
-                caption = f"{meta['checkpoint']}: " + ", ".join(
-                    f"{c['clip']} F1 {c['tac_f1']:.2f}{' ok' if c['success'] else ''}" for c in meta["clips"])
-                out["video_clips/mean_tac_f1"] = sum(c["tac_f1"] for c in meta["clips"]) / len(meta["clips"])
-                out["video_clips/success"] = sum(c["success"] for c in meta["clips"]) / len(meta["clips"])
-            out["rollout_video"] = wandb.Video(str(mp4), caption=caption, format="mp4")
-        return out
+        return new_rollout_videos(self.folder, self._videos_logged)
 
     def finish(self) -> None:
         if self._wandb is not None:
@@ -85,6 +69,39 @@ class MetricLogger:
         if self._tb is not None:
             for k, v in metrics.items():
                 self._tb.add_scalar(k, v, step)
+
+
+def new_rollout_videos(folder: Path, logged: set[str]) -> dict[str, Any]:
+    """wandb items for the rollout videos written into <run>/videos since the last call (render_rollouts.py),
+    with the clips' contact F1 and success from their .json; `logged` keeps the names already sent."""
+    import wandb
+
+    out = {}
+    for mp4 in sorted((Path(folder) / "videos").glob("rollout_*.mp4")):
+        if mp4.name in logged or mp4.name.endswith(".tmp.mp4"):
+            continue
+        logged.add(mp4.name)
+        meta_path = mp4.with_suffix(".json")
+        caption = mp4.stem
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            caption = f"{meta['checkpoint']}: " + ", ".join(
+                f"{c['clip']} F1 {c['tac_f1']:.2f}{' ok' if c['success'] else ''}" for c in meta["clips"])
+            out["video_clips/mean_tac_f1"] = sum(c["tac_f1"] for c in meta["clips"]) / len(meta["clips"])
+            out["video_clips/success"] = sum(c["success"] for c in meta["clips"]) / len(meta["clips"])
+        out["rollout_video"] = wandb.Video(str(mp4), caption=caption, format="mp4")
+    return out
+
+
+def iteration_summary(it: int, info: dict[str, Any], elapsed_s: float) -> str:
+    """One stdout line per logged iteration."""
+    m, r = info["metrics"], info["rollout"]
+    return (f"it {it:6d} | reward {r['mean_reward']:8.3f} len {r['mean_length']:6.1f} | "
+            f"tac F1 {m['tac_f1']:.3f} map {m['tac_map_similarity']:.3f} | wrist {100 * m['e_wrist']:.1f} cm "
+            f"tip {1000 * m['e_tip']:.0f} mm obj {100 * m['e_obj']:.1f} cm | "
+            f"lr {info['train']['learning_rate']:.1e} kl {info['train']['kl_mean']:.4f} "
+            f"std {info['train']['mean_std']:.3f} | {info['speed']['rollout_fps']:.0f} fps | "
+            f"{elapsed_s / 60:.1f} min")
 
 
 def flatten(metrics: dict[str, Any]) -> dict[str, float]:
@@ -111,13 +128,7 @@ class OnPolicyRunner:
                 flat["_iterations_since_log"] = it - last_log
                 last_log = it
                 logger.dump(it, flat)
-                m, r = info["metrics"], info["rollout"]
-                print(f"it {it:6d} | reward {r['mean_reward']:8.3f} len {r['mean_length']:6.1f} | "
-                      f"tac F1 {m['tac_f1']:.3f} map {m['tac_map_similarity']:.3f} | wrist {100 * m['e_wrist']:.1f} cm "
-                      f"tip {1000 * m['e_tip']:.0f} mm obj {100 * m['e_obj']:.1f} cm | "
-                      f"lr {info['train']['learning_rate']:.1e} kl {info['train']['kl_mean']:.4f} "
-                      f"std {info['train']['mean_std']:.3f} | {info['speed']['rollout_fps']:.0f} fps | "
-                      f"{(time.time() - tic) / 60:.1f} min", flush=True)
+                print(iteration_summary(it, info, time.time() - tic), flush=True)
             if (it + 1) % self.args.save_interval == 0 or it == total - 1:
                 path = self.checkpoint_dir / f"checkpoint_{it + 1:05d}.pt"
                 self.algorithm.save(path)

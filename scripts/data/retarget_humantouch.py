@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Retarget both HumanTouch hand skeletons onto the Wuji Hands (wuji_retargeting), resampled to --hz.
+"""Retarget both mocap hand skeletons onto the Wuji Hands (wuji_retargeting), resampled to --hz.
 
-Follows Benchmark-Genesis' hawor_to_wuji_qpos.py: the 25-joint skeleton is reduced to the 21 MediaPipe
-keypoints, invalid frames are filled and the keypoints smoothed, each frame is retargeted
+HumanTouch (extract_humantouch.py) and EgoTouch (extract_egotouch.py) episodes. Follows Benchmark-Genesis'
+hawor_to_wuji_qpos.py: the skeleton is reduced to the 21 MediaPipe keypoints (HumanTouch's 25 joints;
+EgoTouch's Rokoko skeleton already is), invalid frames are filled and the keypoints smoothed, each frame is retargeted
 (configs/retargeting/wuji_mano_<side>.yaml), and the palm_link frame is put on the human wrist with the
 retargeter's own wrist frame (estimate_frame_from_hand_points @ OPERATOR2MANO).
 
-Reads <data>/episodes/*.npz (extract_humantouch.py), writes <data>/retarget/episode_XXXXXX.npz with
-  hz, frame_index (60 Hz source frame of every output frame), and per side:
+Reads <data>/episodes/*.npz, writes <data>/retarget/<same name>.npz with
+  hz, frame_index (source frame of every output frame: HumanTouch 60 Hz, EgoTouch 30 Hz), and per side:
   <side>_qpos (T, 20) in WujiHand.dof_names order, <side>_palm_pos (T, 3), <side>_palm_quat (T, 4) wxyz,
   <side>_keypoints (T, 21, 3) MediaPipe keypoints (world), <side>_valid (T,)
 
@@ -87,7 +88,7 @@ def main() -> None:
     ap.add_argument("--hz", type=float, default=30.0)
     ap.add_argument("--config-dir", default=str(REPO / "configs" / "retargeting"))
     ap.add_argument("--wuji-dir", default=DEFAULT_WUJI_DIR)
-    ap.add_argument("--smooth-window", type=int, default=9, help="Savitzky-Golay window, in 60 Hz frames")
+    ap.add_argument("--smooth-window", type=int, default=9, help="Savitzky-Golay window, in 60 Hz frames (rescaled)")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
     sys.path.insert(0, os.path.abspath(args.wuji_dir))
@@ -96,9 +97,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     hands = {s: WujiHand(s) for s in SIDES}
 
-    episodes = sorted((data / "episodes").glob("episode_*.npz"))
+    episodes = sorted((data / "episodes").glob("*.npz"))
     if not episodes:
-        raise SystemExit(f"no episodes in {data / 'episodes'}: run extract_humantouch.py first")
+        raise SystemExit(f"no episodes in {data / 'episodes'}: run extract_humantouch.py / extract_egotouch.py first")
     for path in episodes:
         dst = out_dir / path.name
         if dst.exists() and not args.overwrite:
@@ -106,17 +107,20 @@ def main() -> None:
             continue
         ep = np.load(path)
         fps = float(ep["fps"])
-        n = len(ep["head_pose"])
+        n = len(ep["left_skeleton"])
         frame_index = np.unique(np.round(np.arange(0, n, fps / args.hz)).astype(int).clip(max=n - 1))
-        res = dict(hz=np.array(args.hz), frame_index=frame_index, episode_index=ep["episode_index"])
+        res = dict(hz=np.array(args.hz), frame_index=frame_index,
+                   **{k: ep[k] for k in ("episode_index", "key") if k in ep.files})
         msg = []
         for side in SIDES:
             valid = ep[f"{side}_skeleton_valid"].astype(bool)
             if valid.ndim > 1:
                 valid = valid.reshape(len(valid), -1).all(1)
-            kp60 = mediapipe_keypoints(ep[f"{side}_skeleton"])
-            valid &= np.isfinite(kp60).all(axis=(1, 2))
-            kp = fill_and_smooth(np.nan_to_num(kp60), valid, args.smooth_window)[frame_index]
+            skeleton = ep[f"{side}_skeleton"]
+            kp_src = skeleton if skeleton.shape[1] == 21 else mediapipe_keypoints(skeleton)
+            valid &= np.isfinite(kp_src).all(axis=(1, 2))
+            window = max(5, int(round(args.smooth_window * fps / 60.0)) | 1)
+            kp = fill_and_smooth(np.nan_to_num(kp_src), valid, window)[frame_index]
             out = retarget_side(kp, side, str(Path(args.config_dir) / f"wuji_mano_{side}.yaml"), hands[side])
             for k, v in out.items():
                 res[f"{side}_{k}"] = v.astype(np.float32)

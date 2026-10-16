@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Place the HumanTouch glove cells on both Wuji hands with both methods (tv2s_env/tactile/mapping.py).
+"""Place the glove cells on both Wuji hands: layout, anatomical (tv2s_env/tactile/mapping.py)
+and mano (glove -> MANO -> Wuji, tv2s_env/tactile/mano_mapping.py; also writes the MANO anchors).
 
-Writes assets/tactile/{layout,anatomical}_{left,right}.npz (TaxelSet), human_proportions.json and a
-check figure per side (the flat Wuji hand, palmar view, taxels coloured by glove region).
+HumanTouch writes assets/tactile/{layout,anatomical,mano}_{left,right}.npz (TaxelSet),
+mano_anchors_{left,right}.npz, human_proportions.json and a check figure per side (the flat Wuji hand,
+palmar view, taxels coloured by glove region). EgoTouch (--dataset egotouch, its layout
+assets/tactile/egotouch_glove.json from extract_egotouch.py) only the dataset-agnostic one:
+mano_egotouch_{left,right}.npz, mano_anchors_egotouch_{left,right}.npz, mappings_egotouch_{side}.png
+(the env's --env.tactile.mapping=mano_egotouch).
 
     python scripts/tactile/build_tactile_mappings.py --data data/humantouch --dataset-root ~/HumanTouch/X001
+    python scripts/tactile/build_tactile_mappings.py --dataset egotouch
 """
 
 import argparse
@@ -19,6 +25,7 @@ sys.path.insert(0, str(REPO / "src"))
 from tv2s_data.glove import load_glove_layout  # noqa: E402
 from tv2s_data.humantouch import SIDES, dataset_paths  # noqa: E402
 from tv2s_env.robots.wuji_model import WujiHand  # noqa: E402
+from tv2s_env.tactile.mano_mapping import humantouch_anchors, mano_to_wuji  # noqa: E402
 from tv2s_env.tactile.mapping import (  # noqa: E402
     WujiSurface,
     build_anatomical_taxels,
@@ -59,8 +66,9 @@ def plot(hand, layout, taxel_sets, path):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", required=True, help="prepared HumanTouch folder (retarget/ gives the human proportions)")
-    ap.add_argument("--dataset-root", required=True)
+    ap.add_argument("--dataset", choices=("humantouch", "egotouch"), default="humantouch")
+    ap.add_argument("--data", default=None, help="prepared HumanTouch folder (retarget/ gives the human proportions)")
+    ap.add_argument("--dataset-root", default=None, help="HumanTouch task folder (its glove mapping)")
     ap.add_argument("--out", default=str(REPO / "assets" / "tactile"))
     ap.add_argument("--finger-tip-row", type=int, default=22)
     ap.add_argument("--points-per-cell", type=int, default=2, help="layout mapping: points per cell side")
@@ -68,6 +76,24 @@ def main() -> None:
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    if args.dataset == "egotouch":
+        from tv2s_data.egotouch import LAYOUT_JSON, write_layout
+
+        layout_json = LAYOUT_JSON if LAYOUT_JSON.exists() else write_layout()
+        for side in SIDES:
+            layout = load_glove_layout(layout_json, side)
+            anchors = humantouch_anchors(layout, angle_span=np.radians(args.angle_span_deg))
+            anchors.save(str(out / f"mano_anchors_egotouch_{side}.npz"))
+            ts = mano_to_wuji(WujiHand(side), anchors)
+            ts.method = "mano_egotouch"
+            ts.save(str(out / f"mano_egotouch_{side}.npz"))
+            print(f"mano_egotouch {side:5s}: {len(ts.channel)} taxels on {len(set(ts.link))} links, "
+                  f"{len(np.unique(ts.channel))}/{ts.n_channels} cells covered")
+            plot(WujiHand(side), layout, [ts], out / f"mappings_egotouch_{side}.png")
+        print("->", out)
+        return
+    if not (args.data and args.dataset_root):
+        raise SystemExit("--data and --dataset-root are needed for HumanTouch")
     mapping_json = dataset_paths(Path(args.dataset_root).expanduser())["tactile_mapping"]
 
     proportions = {}
@@ -81,8 +107,11 @@ def main() -> None:
         layout = load_glove_layout(mapping_json, side, finger_tip_row=args.finger_tip_row)
         hand = WujiHand(side)
         span = np.radians(args.angle_span_deg)
+        anchors = humantouch_anchors(layout, angle_span=span)          # glove -> MANO, then MANO -> Wuji
+        anchors.save(str(out / f"mano_anchors_{side}.npz"))
         sets = [build_layout_taxels(hand, layout, points_per_cell=args.points_per_cell, angle_span=span),
-                build_anatomical_taxels(hand, layout, human, angle_span=span)]
+                build_anatomical_taxels(hand, layout, human, angle_span=span),
+                mano_to_wuji(hand, anchors)]
         for ts in sets:
             ts.save(str(out / f"{ts.method}_{side}.npz"))
             print(f"{ts.method:10s} {side:5s}: {len(ts.channel)} taxels on {len(set(ts.link))} links, "

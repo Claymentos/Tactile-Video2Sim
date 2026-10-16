@@ -5,13 +5,13 @@ tactile reading is computed here, in torch, from the link and object poses:
   distance  d_p = SDF_object(taxel p)                         (Benchmark-Genesis' ContactDepthProbe)
   pressure  f_p = kn * max(probe_radius - d_p, 0)             (a penalty spring, as DexTaG's TactileField)
 Per glove channel: the smallest distance and the largest pressure of its taxels (DexTaG's visualizer
-shows a pixel as its strongest point). `to_image` lays channels out on the 23x20 glove grid.
+shows a pixel as its strongest point). `to_image` lays channels out on the glove grid (HumanTouch: 23x20).
 """
 
 import numpy as np
 import torch
 
-from tv2s_data.glove import GRID_SHAPE, GloveLayout
+from tv2s_data.glove import GloveLayout
 from tv2s_env.tactile.mapping import TaxelSet
 
 
@@ -40,6 +40,7 @@ class GloveSensor:
         self.channel = torch.as_tensor(taxels.channel, dtype=torch.long, device=device)       # (P,)
         self.rows = torch.as_tensor(layout.rows, device=device)
         self.cols = torch.as_tensor(layout.cols, device=device)
+        self.grid_shape = tuple(layout.grid_shape)
         self.region = layout.region
         # per-channel taxel index lists are scatter targets; fingertip masks (row i = finger i)
         self.finger_masks = torch.stack([torch.as_tensor(layout.region == r, device=device)
@@ -58,7 +59,10 @@ class GloveSensor:
         """Per-channel (distance, pressure), each (N, C)."""
         p = self.taxel_world(link_pos, link_rot)
         p_obj = ((p - obj_pos[:, None])[..., None, :] @ obj_rot[:, None])[..., 0, :]
-        d = cylinder_sdf(p_obj, radius, half_length)                                           # (N, P)
+        return self.reduce(cylinder_sdf(p_obj, radius, half_length))
+
+    def reduce(self, d: torch.Tensor):
+        """Per-taxel distances (N, P) -> per-channel (distance, pressure), each (N, C)."""
         f = self.kn * (self.probe_radius - d).clamp(min=0)
         N = d.shape[0]
         idx = self.channel.expand(N, -1)
@@ -67,8 +71,8 @@ class GloveSensor:
         return dist, pressure
 
     def to_image(self, values: torch.Tensor) -> torch.Tensor:
-        """(N, C) channel values -> (N, 23, 20) glove image."""
-        img = torch.zeros((values.shape[0],) + GRID_SHAPE, device=values.device, dtype=values.dtype)
+        """(N, C) channel values -> (N, rows, cols) glove image (HumanTouch: 23 x 20)."""
+        img = torch.zeros((values.shape[0],) + self.grid_shape, device=values.device, dtype=values.dtype)
         img[:, self.rows, self.cols] = values
         return img
 

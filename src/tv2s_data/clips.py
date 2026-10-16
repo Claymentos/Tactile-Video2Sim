@@ -1,8 +1,11 @@
-"""Cut HumanTouch episodes into bimanual training clips and infer a proxy object for each grasping hand.
+"""Clip windows, grasps, and the HumanTouch simulation clips with a proxy object per grasping hand.
 
-A clip is one manipulation cycle from the semantic annotations (a `reach_grasp_*` segment plus the
-`transport_*` segment that follows it, or a `grasp_lift_basket` segment), padded by `pad_s`. Both hands
-are kept in every clip; a hand "grasps" in the clip when its glove reports a sustained contact.
+A clip is one manipulation cycle, padded by `pad_s`, either from the dataset's semantic annotations (a
+`reach_grasp_*` segment plus the `transport_*` segment that follows it, or a `grasp_lift_basket` segment:
+`segment_episode`) or from a Gemini scene parsing of the head-camera video (`scene_windows`). Stage 1
+(tv2s_data/cuts.py) cuts the episodes with these windows; stage 2 (`sim_clip`) turns a HumanTouch cut into
+a simulation clip. Both hands are kept in every clip; a hand "grasps" when its glove reports a sustained
+contact (`grasp_interval`).
 
 HumanTouch has no object pose or mesh, so the object a hand holds is inferred from the glove and the
 retargeted Wuji reference (DexTaG and Benchmark-Genesis both need an object trajectory: DexTaG records it,
@@ -12,22 +15,25 @@ Benchmark-Genesis reconstructs it from video). The proxy is a cylinder:
   - its axis runs across the palm (index knuckle -> little knuckle), its centre sits between the palm
     and the contacting fingertips (power grasp) or among the fingertips (pinch), its radius is the
     contact points' distance to the axis;
-  - it is rigid in the palm while the glove holds it, rests where the grasp started before, and is
-    left where it was released after (its target is invalid shortly after the release);
+  - it is rigid in the palm while the glove holds it, and left where it was released after (its target
+    is invalid shortly after the release). Before the grasp it rests where the grasp started; the
+    environment makes that rest physical (`settle_before_grasp`: the nearest stable pose, on its
+    support, blended into the grasp over a few frames), and likewise puts a placing support under the
+    release pose (`settle_after_release`), where a successful episode leaves the object;
   - the surface it rests on (`support_z`) is put under it at the grasp onset. The two hands get separate
     supports: across the dataset the right hand's lowest fingertip is ~25 cm above the left's, which a
     single table cannot explain.
 Pass a real object (mesh + poses) per clip by replacing `object` in the clip file (same keys).
 """
 
-import json
+import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.ndimage import binary_closing, binary_opening
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
-from tv2s_data.glove import GloveLayout, clean_tactile, contact_from_pressure
+from tv2s_data.glove import GloveLayout
 from tv2s_data.humantouch import SIDES
 
 FINGERS_GLOVE = ("thumb", "index", "middle", "ring", "pinky")
@@ -37,7 +43,7 @@ FINGERS_WUJI = ("thumb", "index", "middle", "ring", "little")
 @dataclass
 class ClipConfig:
     pad_s: float = 0.5
-    max_len_s: float = 10.0
+    max_len_s: float = 120.0                # a cap, not a cut: the goal is the whole demonstration
     min_len_s: float = 1.5
     # tactile cleaning / contact
     baseline_window_s: float = 10.0
@@ -56,6 +62,24 @@ class ClipConfig:
     basket_mass: float = 0.3
     clip_types: tuple[str, ...] = ("reach_grasp", "grasp_lift_basket")
     follow_types: tuple[str, ...] = ("transport",)
+
+
+def clip_config(overrides: list[str]) -> ClipConfig:
+    """ClipConfig with command-line overrides KEY=VALUE (tuples as comma lists)."""
+    cfg = ClipConfig()
+    fields = {f.name for f in dataclasses.fields(cfg)}
+    upd = {}
+    for item in overrides:
+        key, value = item.split("=", 1)
+        if key not in fields:
+            raise SystemExit(f"unknown ClipConfig field {key}: {sorted(fields)}")
+        current = getattr(cfg, key)
+        if isinstance(current, tuple):
+            parts = [p for p in value.strip("()[]").split(",") if p]
+            upd[key] = tuple(type(current[0])(p) if current else p for p in parts)
+        else:
+            upd[key] = type(current)(value)
+    return dataclasses.replace(cfg, **upd)
 
 
 @dataclass
@@ -162,6 +186,54 @@ def cylinder_half_height(rot: np.ndarray, radius: float, length: float) -> float
     return radius * np.sqrt(max(0.0, 1.0 - az * az)) + 0.5 * length * az
 
 
+def stable_rest_pose(pose: np.ndarray, radius: float, length: float, support_top: float) -> np.ndarray:
+    """The resting pose nearest to `pose` of a cylinder on a horizontal support whose top is at
+    `support_top`: lying on its side if its axis is closer to horizontal, standing on an end otherwise
+    (smallest rotation that gets there, centre kept in xy)."""
+    axis = pose[:3, 2]
+    target = np.array([0.0, 0.0, np.sign(axis[2]) or 1.0])
+    if abs(axis[2]) < np.sqrt(0.5):                      # lying: drop the axis' vertical component
+        target = np.array([axis[0], axis[1], 0.0])
+        target /= np.linalg.norm(target)
+    rot = Rotation.align_vectors(target[None], axis[None])[0].as_matrix() @ pose[:3, :3]
+    out = pose.copy()
+    out[:3, :3] = rot
+    out[2, 3] = support_top + cylinder_half_height(rot, radius, length)
+    return out
+
+
+def settle_before_grasp(poses: np.ndarray, t0: int, radius: float, length: float, support_top: float,
+                        blend: int) -> np.ndarray:
+    """Object trajectory with a physical start: at rest on the support (stable_rest_pose of the grasp
+    onset pose) before t0, then blended into the in-palm trajectory over `blend` frames (the hand lifts
+    it into the grasp)."""
+    out = poses.copy()
+    rest = stable_rest_pose(poses[t0], radius, length, support_top)
+    out[:t0] = rest
+    for j in range(min(blend, len(poses) - t0)):
+        a = (j + 1) / (blend + 1)
+        key = Rotation.from_matrix(np.stack([rest[:3, :3], poses[t0 + j, :3, :3]]))
+        out[t0 + j, :3, :3] = Slerp([0.0, 1.0], key)(a).as_matrix()
+        out[t0 + j, :3, 3] = (1 - a) * rest[:3, 3] + a * poses[t0 + j, :3, 3]
+    return out
+
+
+def settle_after_release(poses: np.ndarray, t1: int, radius: float, length: float, support_top: float,
+                         blend: int) -> np.ndarray:
+    """Object trajectory with a physical end: from the release pose (frame t1 - 1), blended over `blend`
+    frames onto its nearest stable pose on the placing support, then at rest there."""
+    out = poses.copy()
+    release = poses[t1 - 1]
+    rest = stable_rest_pose(release, radius, length, support_top)
+    out[t1:] = rest
+    for j in range(min(blend, len(poses) - t1)):
+        a = (j + 1) / (blend + 1)
+        key = Rotation.from_matrix(np.stack([release[:3, :3], rest[:3, :3]]))
+        out[t1 + j, :3, :3] = Slerp([0.0, 1.0], key)(a).as_matrix()
+        out[t1 + j, :3, 3] = (1 - a) * release[:3, 3] + a * rest[:3, 3]
+    return out
+
+
 def object_trajectory(geom: HandGeometry, t0: int, t1: int, t_firm: int, pose_firm: np.ndarray,
                       T: int, release_margin: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Rigid in the palm on [t0, t1), at rest before, left at the release pose after.
@@ -197,71 +269,77 @@ def segment_episode(annotations: list[dict], n_frames: int, frame_index: np.ndar
     return clips
 
 
-def build_episode_clips(episode: dict, retarget: dict, layouts: dict[str, GloveLayout], hands: dict,
-                        cfg: ClipConfig) -> list[dict]:
-    """All clips of one episode (episode: extract_humantouch.py npz, retarget: retarget_humantouch.py npz,
-    hands: {side: WujiHand})."""
-    hz = float(retarget["hz"])
-    frame_index = retarget["frame_index"]
-    n_frames = len(frame_index)
-    annotations = json.loads(str(episode["semantic_annotations"]))
-
-    per_side = {}
-    for side in SIDES:
-        raw = episode[f"{side}_tactile_raw"].astype(np.float32)
-        clean = clean_tactile(raw, float(episode["fps"]), window_s=cfg.baseline_window_s)[frame_index]
-        pressure = clean[:, layouts[side].channels]
-        geom = wuji_reference_geometry(hands[side], retarget[f"{side}_qpos"], retarget[f"{side}_palm_pos"],
-                                       retarget[f"{side}_palm_quat"])
-        per_side[side] = dict(pressure=pressure, contact=contact_from_pressure(pressure, cfg.contact_threshold),
-                              geom=geom)
-    head = episode["head_pose"][frame_index]
-
+def scene_windows(scene: dict, n_frames: int, frame_index: np.ndarray, hz: float, src_fps: float,
+                  cfg: ClipConfig) -> list[dict]:
+    """Clip windows (in resampled frames) from a Gemini scene file (scripts/reconstruction/semantic_parsing.py)."""
+    to_res = lambda t_s: int(np.searchsorted(frame_index, t_s * src_fps))   # first resampled frame >= t_s
     clips = []
-    for k, w in enumerate(segment_episode(annotations, n_frames, frame_index, hz, cfg)):
-        s, e = w["start"], w["end"]
-        T = e - s
-        clip = dict(metadata=dict(episode=int(episode["episode_index"]), clip=k, start=int(s), end=int(e),
-                                  source_frames=frame_index[s:e].astype(np.int64), hz=hz, types=w["types"],
-                                  captions=w["captions"]),
-                    head=dict(pos=head[s:e, :3], quat=head[s:e, [6, 3, 4, 5]]),
-                    hands={})
-        for side in SIDES:
-            g, ps = per_side[side]["geom"], per_side[side]
-            sl = slice(s, e)
-            sub = HandGeometry(palm_pos=g.palm_pos[sl], palm_rot=g.palm_rot[sl], tip_pos=g.tip_pos[sl],
-                               tip_quat=g.tip_quat[sl], knuckles=g.knuckles[sl], keypoints=g.keypoints[sl],
-                               palm_normal_local=g.palm_normal_local)
-            hand = dict(
-                wrist_positions=sub.palm_pos.astype(np.float32),
-                wrist_quat=Rotation.from_matrix(sub.palm_rot).as_quat()[:, [3, 0, 1, 2]].astype(np.float32),
-                dof_positions=retarget[f"{side}_qpos"][sl].astype(np.float32),
-                human_keypoints=retarget[f"{side}_keypoints"][sl].astype(np.float32),
-                fingertip_pos=sub.tip_pos.astype(np.float32),
-                fingertip_quat=sub.tip_quat.astype(np.float32),
-                ref_keypoints=sub.keypoints.astype(np.float32),
-                tactile_pressure=ps["pressure"][sl],
-                tactile_contact=ps["contact"][sl],
-                object=None,
-            )
-            interval = grasp_interval(ps["contact"][sl], layouts[side], hz, cfg)
-            if interval is not None:
-                t0, t1 = interval
-                win = slice(t0, min(t1, t0 + max(1, int(cfg.firm_window_s * hz))))
-                t_firm = t0 + int(np.argmax(ps["contact"][sl][win].sum(1)))
-                pose, radius, length = proxy_cylinder(sub, ps["contact"][sl][t_firm], layouts[side], t_firm, cfg)
-                poses, valid, rel = object_trajectory(sub, t0, t1, t_firm, pose, T,
-                                                      int(round(cfg.release_margin_s * hz)))
-                support_z = float(poses[t0, 2, 3] - cylinder_half_height(poses[t0, :3, :3], radius, length))
-                basket = any(t.startswith("grasp_lift_basket") for t in w["types"])
-                hand["object"] = dict(
-                    type="cylinder", radius=radius, length=length,
-                    mass=cfg.basket_mass if basket else cfg.mass,
-                    pose_matrices=poses.astype(np.float32), valid=valid,
-                    grasp_interval=(int(t0), int(t1)), firm_frame=int(t_firm),
-                    pose_in_palm=rel.astype(np.float32), support_z=support_z,
-                )
-            clip["hands"][side] = hand
-        if any(h["object"] is not None for h in clip["hands"].values()):
-            clips.append(clip)
+    for c in scene["clips"]:
+        s = max(0, to_res(c["start_s"]) - int(cfg.pad_s * hz))
+        e = min(n_frames, to_res(c["end_s"]) + int(cfg.pad_s * hz))
+        e = min(e, s + int(cfg.max_len_s * hz))
+        if e - s >= cfg.min_len_s * hz:
+            clips.append(dict(start=s, end=e, types=[c[f"{side}_hand"]["action"] for side in SIDES],
+                              captions=[c["caption"]], scene=c))
     return clips
+
+
+def sim_clip(cut: dict, arrays: dict, retarget: dict, geoms: dict[str, HandGeometry], head_pose: np.ndarray,
+             layouts: dict[str, GloveLayout], cfg: ClipConfig) -> dict | None:
+    """Simulation clip of one HumanTouch cut (tv2s_data/cuts.py, 60 Hz video frames): the retargeted
+    reference hands on the cut's window (retarget_humantouch.py rate, `retarget["frame_index"]` gives
+    each frame's 60 Hz frame), the cut's glove at those frames, and per grasping hand the proxy object.
+    `geoms`: wuji_reference_geometry of the whole episode per hand; `head_pose`: the episode's 60 Hz head
+    pose. None if no hand grasps in the window (nothing to manipulate)."""
+    m = cut["metadata"]
+    hz, frame_index = float(retarget["hz"]), retarget["frame_index"]
+    s, e = (int(np.searchsorted(frame_index, f)) for f in (m["start"], m["end"]))
+    if e - s < 2:
+        return None
+    T, sl, rows = e - s, slice(s, e), frame_index[s:e] - m["start"]     # rows: the cut's arrays at these frames
+    clip = dict(metadata=dict(episode=m["episode"], clip=m["clip"], name=m["name"], cut=m["name"],
+                              start=s, end=e, source_frames=frame_index[sl].astype(np.int64), hz=hz,
+                              types=m["types"], captions=m["captions"], scene=m["scene"],
+                              tactile_mapping=m["tactile_mapping"], finger_tip_row=m["finger_tip_row"]),
+                head=dict(pos=head_pose[frame_index[sl], :3], quat=head_pose[frame_index[sl]][:, [6, 3, 4, 5]]),
+                hands={})
+    for side in SIDES:
+        g = geoms[side]
+        sub = HandGeometry(palm_pos=g.palm_pos[sl], palm_rot=g.palm_rot[sl], tip_pos=g.tip_pos[sl],
+                           tip_quat=g.tip_quat[sl], knuckles=g.knuckles[sl], keypoints=g.keypoints[sl],
+                           palm_normal_local=g.palm_normal_local)
+        pressure, contact = arrays[f"{side}_pressure"][rows], arrays[f"{side}_contact"][rows]
+        sem = cut["hands"][side]["semantic"]
+        hand = dict(
+            wrist_positions=sub.palm_pos.astype(np.float32),
+            wrist_quat=Rotation.from_matrix(sub.palm_rot).as_quat()[:, [3, 0, 1, 2]].astype(np.float32),
+            dof_positions=retarget[f"{side}_qpos"][sl].astype(np.float32),
+            human_keypoints=retarget[f"{side}_keypoints"][sl].astype(np.float32),
+            fingertip_pos=sub.tip_pos.astype(np.float32),
+            fingertip_quat=sub.tip_quat.astype(np.float32),
+            ref_keypoints=sub.keypoints.astype(np.float32),
+            tactile_pressure=pressure,
+            tactile_contact=contact,
+            object=None,
+            # scene cuts: what Gemini says this hand does (action, object, from, to) and the object's
+            # attributes (description, material, shape, size); None for annotation cuts
+            semantic=sem,
+        )
+        interval = grasp_interval(contact, layouts[side], hz, cfg)
+        if interval is not None:
+            t0, t1 = interval
+            win = slice(t0, min(t1, t0 + max(1, int(cfg.firm_window_s * hz))))
+            t_firm = t0 + int(np.argmax(contact[win].sum(1)))
+            pose, radius, length = proxy_cylinder(sub, contact[t_firm], layouts[side], t_firm, cfg)
+            poses, valid, rel = object_trajectory(sub, t0, t1, t_firm, pose, T, int(round(cfg.release_margin_s * hz)))
+            support_z = float(poses[t0, 2, 3] - cylinder_half_height(poses[t0, :3, :3], radius, length))
+            basket = any(t.startswith("grasp_lift_basket") for t in m["types"]) or bool(sem and sem["object_is_bin"])
+            hand["object"] = dict(
+                type="cylinder", radius=radius, length=length,
+                mass=cfg.basket_mass if basket else cfg.mass,
+                pose_matrices=poses.astype(np.float32), valid=valid,
+                grasp_interval=(int(t0), int(t1)), firm_frame=int(t_firm),
+                pose_in_palm=rel.astype(np.float32), support_z=support_z,
+            )
+        clip["hands"][side] = hand
+    return clip if any(h["object"] is not None for h in clip["hands"].values()) else None

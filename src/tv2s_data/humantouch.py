@@ -1,17 +1,23 @@
 """HumanTouch (LeRobot v2.1, `humantouch` embodiment) constants and episode I/O.
 
-One HumanTouch episode holds, at 60 Hz and in one world frame (z up, metres):
+One HumanTouch episode holds, at 60 Hz and in one world frame (metres):
   - the head pose and both wrist tracker poses (xyz + quaternion xyzw),
   - both hand skeletons: 25 OpenXR-style joints (wrist, then 4-5 joints per finger),
   - both tactile gloves: 460 raw cells each on a 23x20 layout (meta/humantouch/tactile_mapping.json),
   - the semantic sub-task segmentation (meta/humantouch/episodes/episode_XXXXXX.json).
 There is no object pose or mesh in the dataset.
 
-The world frame is left-handed (Unity convention, z up): read as right-handed, every left skeleton has
-the chirality of a right hand (its fingers curl towards cross(index MCP, pinky MCP)) and vice versa,
-while the gloves and skeletons agree on which hand is which. `extract_episode` mirrors y (positions,
-and quaternions as (x, y, z, w) -> (-x, y, -z, w)), which makes the world right-handed and every hand
-geometrically correct for its label.
+The world frame is Unity's: left-handed, y up. Read as a right-handed frame, every skeleton has the
+chirality of the other hand (its fingers curl the wrong way about cross(index MCP, pinky MCP)) and gravity
+is not along -z: the table plane, measured from the head-camera depth and carried into the world with the
+recorded camera calibration, has its normal along +y (0.97). `extract_episode` converts the world to a
+right-handed, z-up frame by swapping y and z (a mirror, which also fixes the handedness): positions
+(x, y, z) -> (x, z, y), quaternions (x, y, z, w) -> (-x, -z, -y, w). Then every hand has its label's
+chirality, the table is horizontal, and the mocap hands, projected with the camera calibration
+(`camera_from_head`), fall inside the gloves' SAM3 masks once its offset is refined
+(scripts/reconstruction/register_camera.py).
+(An earlier fix mirrored each skeleton in its own wrist frame: it gave the right chirality but left the
+world mirrored and tilted.)
 
 `extract_episode` needs pandas/pyarrow (scripts/data/extract_humantouch.py runs it in an env that has
 them); everything else here only needs numpy.
@@ -95,23 +101,49 @@ def load_episode_meta(root: str | Path, episode_index: int) -> dict:
         return json.load(f)
 
 
-_POSE_KEYS = ("head_pose", "left_wrist_tracker", "right_wrist_tracker")
-_POSITION_KEYS = ("left_skeleton", "right_skeleton")
+UNITY_TO_ZUP = np.array([[1.0, 0, 0], [0, 0, 1], [0, 1, 0]])          # (x, y, z) -> (x, z, y), det -1
 
 
-def mirror_y(data: dict[str, np.ndarray]) -> None:
-    """Left-handed -> right-handed world, in place: y -> -y on positions, (x,y,z,w) -> (-x,y,-z,w)."""
-    for key in _POSE_KEYS:
-        data[key][..., 1] *= -1
-        data[key][..., 3] *= -1
-        data[key][..., 5] *= -1
-    for key in _POSITION_KEYS:
-        data[key][..., 1] *= -1
+def unity_to_zup(data: dict[str, np.ndarray]) -> None:
+    """Unity's left-handed y-up world -> right-handed z-up, in place: positions swap y and z, rotations
+    are conjugated by that mirror (quaternion (x, y, z, w) -> (-x, -z, -y, w))."""
+    for key in ("head_pose", "left_wrist_tracker", "right_wrist_tracker"):
+        p = data[key]
+        data[key] = np.concatenate([p[:, [0, 2, 1]], np.stack([-p[:, 3], -p[:, 5], -p[:, 4], p[:, 6]], -1)], -1)
+    for side in SIDES:
+        data[f"{side}_skeleton"] = data[f"{side}_skeleton"][..., [0, 2, 1]]
 
 
-def extract_episode(root: str | Path, episode_index: int, right_handed: bool = True) -> dict[str, np.ndarray]:
+def camera_from_head(extrinsics: dict) -> np.ndarray:
+    """(4, 4) OpenCV camera pose in the head tracker's frame, in the z-up world (unity_to_zup), from the
+    dataset's calibration_extrinsics.json (Euler xyz in degrees, translation in metres).
+
+    Found by projecting the mocap hands into the frames (register_camera.py): read with Unity's world taken
+    as right-handed, the calibration (Euler xyz, no flip) is right once the world is mirrored in x; the z-up
+    world is that mirrored world rotated by Q = S diag(-1, 1, 1) (proper), hence [Q rot | Q t]. It still
+    leaves the hands ~10 cm off the gloves, refined per episode by register_camera.py."""
+    from scipy.spatial.transform import Rotation
+
+    Q = UNITY_TO_ZUP @ np.diag([-1.0, 1.0, 1.0])
+    m = np.eye(4)
+    m[:3, :3] = Q @ Rotation.from_euler("xyz", extrinsics["rotation_rpy_deg"], degrees=True).as_matrix()
+    m[:3, 3] = Q @ np.asarray(extrinsics["translation_m"])
+    return m
+
+
+def _quat_xyzw_to_matrix(q: np.ndarray) -> np.ndarray:
+    q = q / np.linalg.norm(q, axis=-1, keepdims=True)
+    x, y, z, w = np.moveaxis(q, -1, 0)
+    return np.stack([
+        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
+        np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
+        np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1),
+    ], -2)
+
+
+def extract_episode(root: str | Path, episode_index: int, zup: bool = True) -> dict[str, np.ndarray]:
     """Read one episode's parquet into dense float32 / bool arrays (needs pandas + pyarrow).
-    `right_handed` mirrors the left-handed source world (see the module docstring)."""
+    `zup` converts Unity's world to a right-handed z-up frame (see the module docstring)."""
     import pandas as pd
 
     df = pd.read_parquet(episode_parquet(root, episode_index), columns=list(_COLUMNS))
@@ -126,10 +158,10 @@ def extract_episode(root: str | Path, episode_index: int, right_handed: bool = T
         else:
             arr = np.asarray(values)
         out[key] = arr.astype(np.float32) if arr.dtype.kind == "f" else arr
-    if right_handed:
-        mirror_y(out)
+    if zup:
+        unity_to_zup(out)
     meta = load_episode_meta(root, episode_index)
-    out["right_handed"] = np.array(right_handed)
+    out["world"] = np.array("zup" if zup else "unity")
     out["semantic_annotations"] = np.array(json.dumps(meta["semantic_annotations"], ensure_ascii=False))
     out["episode_index"] = np.array(episode_index)
     out["fps"] = np.array(FPS)

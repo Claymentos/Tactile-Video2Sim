@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Extract HumanTouch episodes (LeRobot parquet) into one npz per episode (tv2s_data/humantouch.py).
 
-The world is mirrored to right-handed (see tv2s_data.humantouch). Needs pandas + pyarrow.
+Unity's left-handed y-up world is converted to a right-handed z-up one (see tv2s_data.humantouch). Needs pandas + pyarrow.
 Writes <out>/episodes/episode_XXXXXX.npz.
 
     python scripts/data/extract_humantouch.py --root ~/HumanTouch/X001 --out data/humantouch --max-episodes 20
@@ -37,7 +37,7 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="prepared data folder")
     ap.add_argument("--episodes", default=None, help="comma list / ranges of episode indices")
     ap.add_argument("--max-episodes", type=int, default=20, help="first N episodes when --episodes is not given")
-    ap.add_argument("--no-mirror", action="store_true", help="keep the left-handed source world")
+    ap.add_argument("--no-mirror", action="store_true", help="keep Unity's left-handed y-up world")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
     root = Path(args.root).expanduser()
@@ -59,7 +59,7 @@ def main() -> None:
         if path.exists() and not args.overwrite:
             print(f"episode {e:6d}: exists")
             continue
-        data = extract_episode(root, e, right_handed=not args.no_mirror)
+        data = extract_episode(root, e, zup=not args.no_mirror)
         np.savez_compressed(path, **data)
         T = len(data["head_pose"])
         print(f"episode {e:6d}: {T} frames ({T / float(data['fps']):.1f} s) -> {path}")

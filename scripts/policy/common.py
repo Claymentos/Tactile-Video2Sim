@@ -249,21 +249,24 @@ def latest_run_dir(exp_dir: Path) -> Path:
 
 
 def create_env(env_args: Any, num_envs: int, device: str = "cuda", eval_mode: bool = False,
-               show_viewer: bool = False, render: dict | None = None) -> Any:
+               show_viewer: bool = False, render: dict | None = None,
+               camera_res: tuple[int, int] | None = None) -> Any:
     import genesis as gs
     if not gs._initialized:  # noqa: SLF001
         gs.init(backend=gs.gpu if device == "cuda" else gs.cpu, precision="32", logging_level="warning",
                 seed=env_args.seed, performance_mode=True)
     import tv2s_env.sim.envs as envs
     return getattr(envs, env_args.env_name)(env_args, num_envs=num_envs, show_viewer=show_viewer,
-                                            device=torch.device(device), eval_mode=eval_mode, render=render)
+                                            device=torch.device(device), eval_mode=eval_mode, render=render,
+                                            camera_res=camera_res)
 
 
 @torch.no_grad()
-def evaluate_policy(env: Any, policy: Any, out_path: Path | None = None) -> dict[str, Any]:
+def evaluate_policy(env: Any, policy: Any, out_path: Path | None = None, place_tol: float = 0.06) -> dict[str, Any]:
     """One deterministic episode per environment (the eval env has one env per clip), aids off.
 
-    The same metrics for both methods: success (the episode reached the clip end), completion (fraction
+    The same metrics for both methods: success (the episode reached the clip end with every object within
+    `place_tol` of its reference there: in the hand, or put down on its placing support), completion (fraction
     of the clip played before termination), contact precision / recall / F1 of the simulated glove
     against the real one, the glove-image similarity (DexTaG's reward without its scale), and the palm,
     fingertip and object errors against the reference."""
@@ -293,7 +296,8 @@ def evaluate_policy(env: Any, policy: Any, out_path: Path | None = None) -> dict
         sums["reward"] += reward[:, 0] * r
         steps += r
         done = (terminated | truncated)[:, 0] & running
-        success |= done & (truncated[:, 0] | info["termination"].get("succeeded", torch.zeros_like(done)))
+        reached_end = truncated[:, 0] | info["termination"].get("succeeded", torch.zeros_like(done))
+        success |= done & reached_end & (m["e_obj_end"] < place_tol)
         running &= ~done
     per_clip = []
     for i in range(B):
@@ -359,7 +363,12 @@ def fit_networks(algo: Any, env: Any) -> Any:
 
 
 def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_overrides: tuple,
-                 resume_checkpoint: str | None = None, device: str = "cuda") -> None:
+                 resume_checkpoint: str | None = None, device: str = "cuda", reset_iterations: bool = False,
+                 lightning: bool = False) -> None:
+    """`reset_iterations` (with `resume_checkpoint`): a fine-tune, as rl_recon's train.py --resume --reset-iterations:
+    the network only (a fresh optimiser), iterations counted from 0 (the assist schedule restarts).
+    `lightning`: the same PPO trained by a Lightning Trainer (tv2s_agent.runners.lightning_runner) instead of
+    OnPolicyRunner; same checkpoints, progress.csv and wandb curves."""
     from datetime import datetime
 
     from tv2s_agent.algos.ppo import PPO
@@ -374,26 +383,33 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
     if resume_checkpoint:
         ckpt = Path(resume_checkpoint) if resume_checkpoint != "latest" else \
             sorted((latest_run_dir(REPO / "logs" / exp_name) / "checkpoints").glob("*.pt"))[-1]
-        ppo.load(ckpt)
+        ppo.load(ckpt, load_optimizer=not reset_iterations)
+        if reset_iterations:
+            ppo.current_iter = 0
         start = ppo.current_iter
-        print(f"Resumed from {ckpt} at iteration {start}")
+        print(f"Resumed from {ckpt} at iteration {start}" + (" (fine-tune: iterations reset)" if reset_iterations else ""))
     run_dir = REPO / "logs" / exp_name / datetime.now().strftime("%Y%m%d_%H%M%S")
     save_config(env_args, run_dir / "configs" / "env_args.json")
     save_config(algo, run_dir / "configs" / "algo_cfg.json")
     save_config(runner_args, run_dir / "configs" / "runner_args.json")
     print(f"Run directory: {run_dir}")
-    runner = OnPolicyRunner(ppo, runner_args, run_dir)
     mapping = env_args.tactile.mapping
     wandb_init = dict(name=exp_name, group=os.environ.get("WANDB_RUN_GROUP") or None,
                       job_type="train", tags=[method, mapping, env_name],
                       config=dict(method=method, mapping=mapping, env_name=env_name, num_envs=num_envs,
                                   env=json.loads(env_args.model_dump_json()), algo=json.loads(algo.model_dump_json()),
-                                  runner=json.loads(runner_args.model_dump_json())))
-    logger = MetricLogger(run_dir, wandb_init)
-    try:
-        summary = runner.train(logger, start_iteration=start)
-    finally:
-        logger.finish()
+                                  runner=json.loads(runner_args.model_dump_json()),
+                                  trainer="lightning" if lightning else "onpolicy"))
+    if lightning:
+        from tv2s_agent.runners.lightning_runner import train_lightning
+        summary = train_lightning(ppo, runner_args, run_dir, wandb_init, start_iteration=start)
+    else:
+        runner = OnPolicyRunner(ppo, runner_args, run_dir)
+        logger = MetricLogger(run_dir, wandb_init)
+        try:
+            summary = runner.train(logger, start_iteration=start)
+        finally:
+            logger.finish()
     (run_dir / "TRAINING_DONE").touch()
     print(f"Training done: {summary['iterations']} iterations in {summary['total_time'] / 60:.1f} min")
 
@@ -413,11 +429,10 @@ def evaluate_run(method: str, exp_name: str, checkpoint: str | None = None, all_
 
     from tv2s_agent.algos.config.schema import PPOArgs
     from tv2s_agent.algos.ppo import PPO
-    from tv2s_env.sim.envs.config.schema import DexTaGEnvArgs, ReconEnvArgs
+    from tv2s_env.sim.envs.config.schema import load_env_args
 
     run_dir = latest_run_dir(REPO / "logs" / exp_name)
-    env_cls = DexTaGEnvArgs if method == "dextag" else ReconEnvArgs
-    env_args = load_config(env_cls, run_dir / "configs" / "env_args.json")
+    env_args = load_env_args(run_dir / "configs" / "env_args.json")
     if split_mode:
         env_args = env_args.model_copy(update={"data": env_args.data.model_copy(update={"split_mode": split_mode})})
     env_args = apply_overrides_generic(env_args, env_overrides or {}, prefixes=("env.",))

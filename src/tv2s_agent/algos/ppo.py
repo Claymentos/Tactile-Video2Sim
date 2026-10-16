@@ -95,7 +95,9 @@ class PPO:
                     reward_terms=mean(reward_terms), metrics=m, termination=mean(terminations))
 
     # ------------------------------------------------------------------ update
-    def _train_one_batch(self, mb: dict[GAEBufferKey, torch.Tensor]) -> dict[str, float]:
+    def compute_losses(self, mb: dict[GAEBufferKey, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
+        """Total loss of a minibatch (clipped surrogate + value + entropy) and its statistics; shared with the
+        Lightning variant (tv2s_agent.runners.lightning_runner), which does the optimiser steps itself."""
         cfg = self.cfg
         actor_obs, critic_obs = mb[GAEBufferKey.ACTOR_OBS], mb[GAEBufferKey.CRITIC_OBS]
         adv, ret = mb[GAEBufferKey.ADVANTAGES], mb[GAEBufferKey.RETURNS]
@@ -116,16 +118,26 @@ class PPO:
             value_loss = (ret - values).pow(2).mean()
         entropy = dist.entropy().sum(-1).mean()
         loss = policy_loss + cfg.value_loss_coef * value_loss - cfg.entropy_coef * entropy
+        return loss, dict(policy_loss=policy_loss.item(), value_loss=value_loss.item(), entropy=entropy.item(),
+                          kl_mean=kl.item())
+
+    @property
+    def actor_steps(self) -> bool:
+        """The actor is updated once the critic warm-up is over."""
+        return self.current_iter >= self.cfg.critic_warmup_iters
+
+    def _train_one_batch(self, mb: dict[GAEBufferKey, torch.Tensor]) -> dict[str, float]:
+        cfg = self.cfg
+        loss, stats = self.compute_losses(mb)
         self._actor_optimizer.zero_grad()
         self._critic_optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self._actor.parameters(), cfg.max_grad_norm)
         nn.utils.clip_grad_norm_(self._critic.parameters(), cfg.max_grad_norm)
         self._critic_optimizer.step()
-        if self.current_iter >= cfg.critic_warmup_iters:
+        if self.actor_steps:
             self._actor_optimizer.step()
-        return dict(policy_loss=policy_loss.item(), value_loss=value_loss.item(), entropy=entropy.item(),
-                    kl_mean=kl.item())
+        return stats
 
     def _update_learning_rate(self, kl_mean: float) -> None:
         cfg = self.cfg
@@ -142,8 +154,15 @@ class PPO:
         t0 = time.time()
         rollout = self._collect_rollouts()
         t1 = time.time()
-        stats = [self._train_one_batch(mb) for mb in self._rollouts.minibatch_gen(self.cfg.num_mini_batches,
-                                                                                  self.cfg.num_epochs)]
+        stats = [self._train_one_batch(mb) for mb in self.minibatches()]
+        return self.finish_iteration(rollout, stats, t0, t1)
+
+    def minibatches(self):
+        return self._rollouts.minibatch_gen(self.cfg.num_mini_batches, self.cfg.num_epochs)
+
+    def finish_iteration(self, rollout: dict[str, Any], stats: list[dict[str, float]], t0: float,
+                         t1: float) -> dict[str, Any]:
+        """After the update: normalisers, buffer, KL-adaptive learning rate, iteration count; the logged info."""
         if self._actor_norm is not None:
             self._actor_norm.update(self._rollouts._buffer[GAEBufferKey.ACTOR_OBS].flatten(0, 1))
             self._critic_norm.update(self._rollouts._buffer[GAEBufferKey.CRITIC_OBS].flatten(0, 1))

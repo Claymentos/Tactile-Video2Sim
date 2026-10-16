@@ -13,6 +13,7 @@ Evaluate (one env per clip, deterministic, no aids):
     python scripts/policy/run_ppo_dextag.py --exp_name=dextag_v1 --eval [--split_mode=eval] [--all_checkpoints]
 Overrides (dot notation): --env.tactile.mapping=anatomical --env.data.split_mode=train
     --reward_args.WeightedGaussianBlurredTactileMapSimilarityReward.scale=0  --algo.lr=3e-4  --runner.save_interval=250
+Lightning variant (same PPO, a Lightning Trainer, wandb logged from the LightningModule with TV2S_WANDB=1): --lightning
 """
 
 import sys
@@ -20,16 +21,18 @@ import sys
 from common import evaluate_run, parse_cli, split_overrides, train_policy
 
 MAIN_ARGS = {"exp_name", "env_name", "num_envs", "eval", "checkpoint", "all_checkpoints", "split_mode",
-             "resume_checkpoint", "device"}
+             "resume_checkpoint", "lightning", "device"}
 
 
 def main(exp_name: str, env_name: str = "bimanual_dextag", num_envs: int = 1024, eval: bool = False,
          checkpoint: str | None = None, all_checkpoints: bool = False, split_mode: str | None = None,
-         resume_checkpoint: str | None = None, device: str = "cuda", overrides: tuple = ({}, {}, {})) -> None:
+         resume_checkpoint: str | None = None, lightning: bool = False, device: str = "cuda",
+         overrides: tuple = ({}, {}, {})) -> None:
     if eval:
         evaluate_run("dextag", exp_name, checkpoint, all_checkpoints, split_mode, overrides[0], device)
     else:
-        train_policy("dextag", exp_name, env_name, num_envs, overrides, resume_checkpoint, device)
+        train_policy("dextag", exp_name, env_name, num_envs, overrides, resume_checkpoint, device,
+                     lightning=lightning)
 
 
 if __name__ == "__main__":
