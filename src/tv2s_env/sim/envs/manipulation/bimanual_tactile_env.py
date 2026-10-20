@@ -14,9 +14,9 @@ Episode clips (scripts/data/build_episode_clip.py, `self.episode`): one clip is 
 its reconstructed objects -- every RecGen mesh as a Genesis body (fixed or free, its mass) on its tracked
 trajectory, and per hand an object schedule (the object Gemini says the hand manipulates, frame by frame).
 Each hand's "object" buffers are its scheduled object's, so the per-hand reward terms are unchanged; the
-glove reads the distance to every object (tactile/mesh_sdf.py grids). Training episodes start
-anywhere in the demonstration (`episode_manip_weight` times as often inside a manipulation) and last
-`episode_window_s`; evaluation plays the whole demonstration. rl_recon's in-palm assist holds each hand's
+glove reads the distance to every object (tactile/mesh_sdf.py grids). Training episodes play the whole
+demonstration from frame 0, as evaluation (`train_start=random`: they start anywhere, `episode_manip_weight`
+times as often inside a manipulation, and last `episode_window_s`). rl_recon's in-palm assist holds each hand's
 scheduled object during the reference's holds (ReconBimanualEnv._assist_episode); DexTaG's object aids
 (guide and kicks) assume one object per hand and are off in this mode.
 
@@ -50,7 +50,7 @@ from tv2s_env.robots.wuji_model import base_coordinates, mean_rotation
 from tv2s_env.sim.envs.config.schema import BimanualEnvArgs
 from tv2s_env.sim.robots.floating_hands import FloatingWujiHand
 from tv2s_env.tactile.mapping import TaxelSet
-from tv2s_env.tactile.mesh_sdf import MeshDistance
+from tv2s_env.tactile.mesh_sdf import MeshDistance, collision_mesh
 from tv2s_env.tactile.sensor import GloveSensor
 
 PARK_POS = np.array([2.0, 0.0])        # where objects of hands without an object wait (xy, on the ground)
@@ -226,7 +226,7 @@ class BimanualTactileEnv(BaseEnv):
             for i, L in enumerate(self.lengths):
                 self.ref[k][i, L:] = 0.0
         print(f"Loaded {self.n_clips} clips ({self.lengths.sum()} frames at {self.hz:g} Hz) from {clip_dir}; "
-              f"objects: {int(self.obj_active[:, 0].sum())} left, {int(self.obj_active[:, 1].sum())} right")
+              "objects: " + ", ".join(f"{int(self.obj_active[:, h].sum())} {s}" for h, s in enumerate(self.sides)))
 
     def _active_sides(self, clips: list[dict]) -> tuple[str, ...]:
         """The hands simulated (`active_hands`): "auto" keeps those with an object in some clip (episode clips:
@@ -248,7 +248,8 @@ class BimanualTactileEnv(BaseEnv):
         if self.n_clips != 1:
             raise ValueError("episode clips are trained one at a time (data.clips: one episode clip)")
         L, dt = int(self.lengths[0]), self.dt
-        self.scene_objects = c["scene_objects"]
+        # simulated on their solid collision mesh (mesh_sdf.collision_mesh: a RecGen bottle is a hollow shell)
+        self.scene_objects = [{**o, "mesh": str(collision_mesh(o["mesh"]))} for o in c["scene_objects"]]
         N = len(self.scene_objects)
         all_pos = np.stack([o["poses"][:, :3, 3] for o in self.scene_objects], 1).astype(np.float64)   # (T, N, 3)
         all_rot = np.stack([o["poses"][:, :3, :3] for o in self.scene_objects], 1).astype(np.float64)
@@ -307,16 +308,16 @@ class BimanualTactileEnv(BaseEnv):
               f"the frames" + ("" if self.tactile_available else ", no tactile reference"))
 
     def _episode_start(self, envs_idx: torch.Tensor) -> torch.Tensor:
-        """Episode mode: training starts anywhere (manipulations weighted), evaluation at the beginning."""
+        """Episode mode: frame 0 (evaluation, train_start=first), else anywhere (manipulations weighted)."""
         n = len(envs_idx)
-        if self._eval_mode:
+        if self._eval_mode or self._args.train_start == "first":
             return torch.zeros(n, dtype=torch.long, device=self.device)
         w = self.start_weight[: int(self.lengths[0]) - 2]
         return torch.multinomial(w, n, replacement=True, generator=self.generator)
 
     def _episode_horizon(self, envs_idx: torch.Tensor, start: torch.Tensor) -> torch.Tensor:
         end = self.lengths_t[self.env_clip[envs_idx]] - 1
-        if self._eval_mode:
+        if self._eval_mode or self._args.train_start == "first":
             return end
         return torch.minimum(start + int(round(self._args.episode_window_s * self.hz)), end)
 
@@ -518,7 +519,7 @@ class BimanualTactileEnv(BaseEnv):
         self.set_reference_ghosts()
         palms = self.base_pos.cpu().numpy()                                            # (B, H, 3)
         centre = palms.mean(1)
-        spread = np.linalg.norm(palms[:, 0] - palms[:, 1], axis=-1)                    # frame both hands
+        spread = np.linalg.norm(palms[:, 0] - palms[:, -1], axis=-1)                   # frame both hands (0: one hand)
         view = np.array([0.0, -0.85, 0.53])
         offsets = np.asarray(self.scene.envs_offset)
         offsets = offsets - offsets[0]                     # the camera's poses are relative to env 0

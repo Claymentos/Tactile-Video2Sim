@@ -18,7 +18,8 @@ Euclidean distance transform on each side (~half a voxel accurate; a mesh that i
 its shell only). Cached in outputs/sdf_cache, keyed by the mesh's content.
 
 `collision_mesh`: Benchmark-Genesis' collision geometry (rl_recon/prepare_reference.py: the mesh decimated
-to --collision-faces): the mesh itself if it is small enough, else a decimated copy next to it.
+to --collision-faces), by default solid: enclosed cavities filled (`solid_mesh`), so that the signed distance
+and the physics see a closed container's inside as inside.
 """
 
 from pathlib import Path
@@ -52,18 +53,62 @@ def distance_grid(mesh_path: str | Path, voxel: float = 0.003, margin: float = 0
     return grid, lower, voxel
 
 
-def collision_mesh(mesh_path: str | Path, faces: int = 4000) -> Path:
-    """The mesh decimated to at most `faces` faces (collision_<faces>.obj next to it), cached."""
+def collision_mesh(mesh_path: str | Path, faces: int = 4000, solid: bool = True) -> Path:
+    """The mesh decimated to at most `faces` faces (collision_<faces>.obj next to it), cached. With `solid`
+    (<mesh>_solid_<faces>.obj), made solid first (`solid_mesh`)."""
     mesh_path = Path(mesh_path)
-    out = mesh_path.parent / f"collision_{faces}.obj"
+    out = mesh_path.parent / (f"{mesh_path.stem}_solid_{faces}.obj" if solid else f"collision_{faces}.obj")
     if out.exists() and out.stat().st_mtime >= mesh_path.stat().st_mtime:
         return out
     import trimesh
 
     mesh = trimesh.load(mesh_path, force="mesh")
-    if len(mesh.faces) <= faces:
+    if solid:
+        mesh = solid_mesh(mesh)
+    elif len(mesh.faces) <= faces:
         return mesh_path
-    mesh.simplify_quadric_decimation(face_count=faces).export(out)
+    if len(mesh.faces) > faces:
+        mesh = mesh.simplify_quadric_decimation(face_count=faces)
+    mesh.export(out)
+    return out
+
+
+def solid_mesh(mesh, pitch: float = 0.0015, max_cells: int = 256, min_fill: float = 0.2):
+    """The mesh made solid: RecGen meshes a bottle as a hollow shell (sealed, or open at its mouth), whose
+    signed distance calls the hollow "outside" and whose thin walls the fingers pass through. Its surface is
+    voxelised in its oriented bounding box (`pitch` grown so that no side exceeds `max_cells`), the enclosed
+    cavities filled in 3D, else, when that fills less than `min_fill` of the volume the cross-sections enclose,
+    every cross-section along the long axis filled (a mouth closed, an open container filled too), and the
+    occupancy re-meshed (marching cubes, ~half a voxel accurate). A mesh without a hollow is returned as is."""
+    import trimesh
+    from scipy import ndimage
+    from skimage import measure
+
+    to_box = np.linalg.inv(mesh.bounding_box_oriented.primitive.transform)
+    ext = mesh.bounding_box_oriented.primitive.extents
+    order = [*(i for i in range(3) if i != int(np.argmax(ext))), int(np.argmax(ext))]       # the long axis last
+    pitch = max(pitch, float(ext.max()) / (max_cells - 7))
+    samples = int(min(4e6, 8 * mesh.area / pitch ** 2))
+    pts = trimesh.transform_points(trimesh.sample.sample_surface(mesh, samples, seed=0)[0], to_box)[:, order]
+    lower = pts.min(0) - 3 * pitch
+    idx = np.round((pts - lower) / pitch).astype(int)
+    occ = np.zeros(idx.max(0) + 4, bool)
+    occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    sections = np.stack([ndimage.binary_fill_holes(occ[..., z]) for z in range(occ.shape[2])], -1)
+    hollow = sections.sum() - occ.sum()
+    if hollow < min_fill * occ.sum():
+        return mesh
+    filled = ndimage.binary_fill_holes(occ)
+    how = "enclosed cavity"
+    if filled.sum() - occ.sum() < min_fill * hollow:
+        filled, how = sections, "cross-sections along the long axis"
+    v, f, _, _ = measure.marching_cubes(np.pad(filled, 1).astype(np.float32), 0.5)
+    v = (v - 1) * pitch + lower
+    v[:, order] = v.copy()
+    out = trimesh.Trimesh(trimesh.transform_points(v, np.linalg.inv(to_box)), f)
+    out = max(out.split(only_watertight=False), key=lambda b: len(b.faces))
+    out.fix_normals()
+    print(f"  solid collision mesh ({how} filled): volume {abs(mesh.volume) * 1e6:.0f} -> {out.volume * 1e6:.0f} cm3")
     return out
 
 

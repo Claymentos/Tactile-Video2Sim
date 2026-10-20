@@ -8,8 +8,8 @@ Follows ReconEnv, per hand:
     distance per channel); the reference glove contacts 1 and 5 frames ahead; keypoint errors; the last
     action.
   - Reward: soft contact F1 + reach (tactile), hand kernels, object position / axis hinges, action rate.
-  - Episodes: from frame 0, from a random frame before the first grasp, or (reference state
-    initialisation) inside a grasp with the object in the reference hand; terminated when the palm,
+  - Episodes: from frame 0 (`train_start=random`: also from a random frame before the first grasp, or
+    (reference state initialisation) inside a grasp with the object in the reference hand); terminated when the palm,
     the keypoints or the object drift too far, truncated at the clip end.
   - Training aid: a velocity-level controller holding each object at its in-palm pose while the glove
     reports the grasp (DexMachina's virtual object controller anchored to the hand), scaled by
@@ -30,7 +30,7 @@ class ReconBimanualEnv(BimanualTactileEnv):
                  device: torch.device = torch.device("cuda"), eval_mode: bool = False,
                  render: dict | None = None, camera_res: tuple[int, int] | None = None) -> None:
         self.assist_scale = 0.0
-        self.random_start = not eval_mode
+        self.random_start = not eval_mode and args.train_start == "random"
         self.disable_termination = False
         self.in_hand_start = False
         super().__init__(args, num_envs, show_viewer, device, eval_mode, render, camera_res)

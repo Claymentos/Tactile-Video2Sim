@@ -97,8 +97,12 @@ class BimanualEnvArgs(BaseModel):
     work_dir: str = "outputs/urdf"           # floating-base URDFs are written here
     reward_args: dict[str, dict[str, float]]
     reward_scale_by_dt: bool = True          # DexTaG multiplies every reward scale by dt
+    # training starts: "first" where evaluation starts (frame 0, or the first frame where the reference hands
+    # clear the resting objects), the whole demonstration; "random": anywhere (the options below)
+    train_start: Literal["first", "random"] = "first"
     # episode clips (scripts/data/build_episode_clip.py: a whole demonstration with its reconstructed objects):
-    # training episodes start anywhere and last this long; evaluation plays the whole demonstration
+    # with train_start=random, training episodes start anywhere and last this long; evaluation plays the whole
+    # demonstration
     episode_window_s: float = 6.0
     episode_manip_weight: float = 4.0        # a start inside a manipulation is this many times as likely
     # hands simulated: both, one side, or "auto" (the hands that manipulate an object in the clips); a hand
@@ -144,7 +148,7 @@ class ReconEnvArgs(BimanualEnvArgs):
     obs_future: tuple[int, ...] = (1, 2, 4)
     obs_tactile_future: tuple[int, ...] = (1, 5)
     glove_obs: bool = True                   # False: GT glove contacts zeroed in the observation (ablation)
-    # episodes
+    # episodes (train_start=random)
     start_frame_prob: float = 0.5            # random start before the first grasp (else frame 0)
     rsi_grasp_prob: float = 0.5              # start inside a grasp with the object in the reference hand
     term_wrist: float = 0.10
@@ -212,16 +216,18 @@ class RlReconEnvArgs(BaseModel):
     obj_rot_weight: float = 0.0                # hinge on the full rotation error (off, as rl_recon)
     obj_rot_margin: float = 0.6
     obj_depth_discount: float = 3.0            # the object error along the camera ray counts 1/x (termination)
-    # episodes
-    start_frame_prob: float = 0.5              # random start where the objects rest (else frame 0)
+    # episodes. Training starts: "first" where evaluation starts (frame 0, or the first frame where the reference
+    # hands clear the resting objects), to the clip end; "random": anywhere (the options below)
+    train_start: Literal["first", "random"] = "first"
+    start_frame_prob: float = 0.5              # train_start=random: random start where the objects rest (else frame 0)
     rest_starts: Literal["before_first_grasp", "away_from_holds"] = "before_first_grasp"   # rl_recon: the first
     rest_margin_s: float = 0.33                # ... at least this far from a grasp (rl_recon: 10 frames)
-    rsi_grasp_prob: float = 0.5                # start at a grasp frame, the object in the reference hand
+    rsi_grasp_prob: float = 0.5                # train_start=random: start at a grasp frame, the object in the hand
     rsi_min_contact_frac: float = 0.5          # ... where the glove fires >= this x the hand's peak
     rsi_min_clearance: float = 0.003           # ... and the held object clears the table (m)
     start_clearance: float = -1.0              # starts need the reference taxels this far from resting objects (m);
                                                # < 0: the reference's (this pipeline's: 5 mm; Benchmark-Genesis': off)
-    episode_window_s: float = 0.0              # training episodes last this long; 0: to the clip end (rl_recon)
+    episode_window_s: float = 0.0              # train_start=random: episodes last this long; 0: to the clip end
     eval_start: Literal["first", "in_hand"] = "first"   # evaluation: from frame 0, or in hand (rl_recon's two)
     term_wrist: float = 0.10
     term_kp: float = 0.06

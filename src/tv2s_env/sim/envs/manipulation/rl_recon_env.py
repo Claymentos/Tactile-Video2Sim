@@ -26,9 +26,10 @@ ReconEnv term by term, per hand, objects averaged (rl_recon: one hand, one objec
                             reference has one (Benchmark-Genesis' mask_axes.py), else its projected reference axis
                object terms over the task objects (the free objects the simulated hands hold), where their
                reference is valid; zero reward when the simulation blows up.
-  episodes     training: from frame 0, from a random frame before the first grasp (`rest_starts`), or (reference
-               state initialisation) at a grasp frame with the object at its pose in the reference palm, where the
-               glove fires firmly and the object clears the table; to the clip end. The first episodes end at
+  episodes     training (`train_start`): from frame 0 (or the first frame clear of the resting objects) as
+               evaluation, or ("random") from frame 0, from a random frame before the first grasp (`rest_starts`),
+               or (reference state initialisation) at a grasp frame with the object at its pose in the reference
+               palm, where the glove fires firmly and the object clears the table; to the clip end. The first episodes end at
                random frames (rl_recon/train.py), so the envs spread over the clip. Terminated when a palm, its
                keypoints or a task object drift too far. Evaluation (`eval_start`): from frame 0, or in hand from
                the first in-hand start frame (rl_recon/train.py's two evaluations).
@@ -707,7 +708,7 @@ class RlReconEnv(BaseEnv):
         if self._eval_mode:
             if a.eval_start == "in_hand" and len(self.rsi_frames_t):
                 start[:], in_hand[:] = self.rsi_frames_t[0], True
-        else:
+        elif a.train_start == "random":
             if len(self.rest_frames_t) and a.start_frame_prob > 0:
                 pick = torch.rand(n, device=dev, generator=gen) < a.start_frame_prob
                 k = torch.randint(0, len(self.rest_frames_t), (n,), device=dev, generator=gen)
@@ -719,7 +720,7 @@ class RlReconEnv(BaseEnv):
         self._reset_hands_and_objects(envs_idx, start, in_hand)
         self.t[envs_idx], self.start[envs_idx] = start, start
         horizon = torch.full_like(start, self.T - 1)
-        if not self._eval_mode and a.episode_window_s > 0:
+        if not self._eval_mode and a.train_start == "random" and a.episode_window_s > 0:
             horizon = torch.minimum(start + int(round(a.episode_window_s * self.hz)), horizon)
         self.horizon[envs_idx] = horizon
         self.last_action[envs_idx] = 0.0
