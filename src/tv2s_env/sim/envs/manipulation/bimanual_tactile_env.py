@@ -256,12 +256,17 @@ class BimanualTactileEnv(BaseEnv):
         sched = np.stack([c["hands"][s]["object_schedule"] for s in self.sides], 1)                       # (T, H)
         per = {k: [] for k in keys}
         held = np.zeros((L, self.H), bool)                          # the holds of build_episode_clip.py (glove contact)
+        # the object's pose in the palm while held, when the clip gives one apart from its trajectory (hold_offsets:
+        # clip_from_bg_reference.py's tactile grasp pose); NaN elsewhere: the trajectory's pose in the reference palm
+        hold_offset = np.full((L, self.H, 4, 4), np.nan)
         for k, o in enumerate(self.scene_objects):
-            for s, a, b in o.get("holds", []):
+            for i, (s, a, b) in enumerate(o.get("holds", [])):
                 if s not in self.sides:
                     continue
                 h = self.sides.index(s)
                 held[a:b, h] |= sched[a:b, h] == k
+                if o.get("hold_offsets") is not None:
+                    hold_offset[a:b, h][sched[a:b, h] == k] = o["hold_offsets"][i]
         self.obj_spec = np.tile([DEFAULT_CYLINDER[k] for k in ("radius", "length", "mass")], (1, self.H, 1)).astype(float)
         self.obj_active = (sched >= 0).any(0)[None]
         self.support_z, self.place_z = np.zeros((1, self.H)), np.full((1, self.H), -1.0)
@@ -297,6 +302,7 @@ class BimanualTactileEnv(BaseEnv):
         self.ref["all_obj_pos"] = f(all_pos)[None]                                                     # (1, T, N, 3)
         self.ref["all_obj_quat"] = f(np.stack([np_quat_continuity(_rotmats_to_quats(all_rot[:, k])) for k in range(N)], 1))[None]
         self.ref["schedule"] = torch.as_tensor(sched, device=self.device)[None]                       # (1, T, H)
+        self.ref["hold_offset"] = f(hold_offset)[None]                                                 # (1, T, H, 4, 4)
         manip = (sched >= 0).any(1)
         self.start_weight = f(1.0 + (self._args.episode_manip_weight - 1.0) * manip)
         self.lengths_t = torch.as_tensor(self.lengths, device=self.device)

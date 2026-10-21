@@ -132,6 +132,10 @@ class ReconBimanualEnv(BimanualTactileEnv):
         obj_p, obj_R = self.ref_at("obj_pos", t1), self.ref_at("obj_rot", t1)
         anchor_p = (ref_R.transpose(-1, -2) @ (obj_p - ref_p)[..., None])[..., 0]
         anchor_R = ref_R.transpose(-1, -2) @ obj_R
+        off = self.ref_at("hold_offset", t1)                       # the clip's pose in the palm (NaN: none)
+        given = torch.isfinite(off).all(-1).all(-1)[..., None]
+        anchor_p = torch.where(given, off[..., :3, 3], anchor_p)
+        anchor_R = torch.where(given[..., None], off[..., :3, :3], anchor_R)
         p_target = self.base_pos + (self.base_rot @ anchor_p[..., None])[..., 0]
         R_target = self.base_rot @ anchor_R
         solver = self.scene.sim.rigid_solver
