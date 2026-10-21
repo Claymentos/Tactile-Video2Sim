@@ -21,6 +21,7 @@ PY_DATA="${PY_DATA:-$CONDA_BASE/envs/lerobot/bin/python}"              # pandas 
 PY_RETARGET="${PY_RETARGET:-$CONDA_BASE/envs/wuji_retargeting/bin/python}"   # pinocchio + wuji_retargeting
 PY_SIM="${PY_SIM:-$CONDA_BASE/envs/genesis/bin/python}"                # genesis-world, torch, trimesh
 PY_GEMINI="${PY_GEMINI:-$CONDA_BASE/envs/sam3d/bin/python}"            # google-genai (semantic_parsing.py)
+PY_QWEN="${PY_QWEN:-$CONDA_BASE/envs/lerobot/bin/python}"              # transformers + qwen-vl-utils (semantic_parsing.py --backend qwen)
 PY_SAM3="${PY_SAM3:-$CONDA_BASE/envs/sam3/bin/python}"                 # SAM3 video segmentation
 PY_MOGE="${PY_MOGE:-$CONDA_BASE/envs/moge/bin/python}"                 # MoGe metric depth
 PY_RECGEN="${PY_RECGEN:-$CONDA_BASE/envs/recgen/bin/python}"           # RecGen meshes

@@ -5,14 +5,16 @@
 #   2  extract   episodes -> npz (Rokoko / Vive Unity worlds -> right-handed z-up, stalled streams flagged)
 #                + the glove layout assets/tactile/egotouch_glove.json                                  [PY_SIM]
 #   3  retarget  both Rokoko skeletons -> Wuji Hand joints + palm pose, at HZ                         [PY_RETARGET]
-#   4  parse     Gemini on each episode's chest video, with the task as context
-#                -> data/egotouch/scene/<key>.json (skipped if present; needs GEMINI_API_KEY)            [PY_GEMINI]
+#   4  parse     Gemini (or, VLM=qwen, Qwen-VL run locally) on each episode's chest video, with the task as
+#                context -> data/egotouch/scene/<key>.json (skipped if present; Gemini needs GEMINI_API_KEY)
+#                                                                                          [PY_GEMINI / PY_QWEN]
 #   5  cut       one cut per episode (the scene's clips if parsed), glove per hand, one mp4 per cut   [PY_SIM]
 #   6  mapping   glove taxels -> MANO -> Wuji: assets/tactile/mano_egotouch_{left,right}.npz           [PY_SIM]
 # Then, per episode: launch/reconstruct_objects.sh egotouch <key>, and scripts/data/build_episode_clip.py.
 #
 # Usage:   launch/prepare_egotouch.sh [EPISODES]      keys, tasks or recording times, comma-separated (default: all downloaded)
 # Knobs:   DOWNLOAD=1 TASKS=pick_up_bottle,twist_bottle_cap PER_TASK=5   HZ=30  MODEL=gemini-3.6-flash  GEMINI_FPS=4
+#          VLM=qwen (local Qwen-VL instead of Gemini; MODEL: a Hugging Face Qwen-VL, default Qwen/Qwen3-VL-4B-Instruct)
 #          SKIP_PARSE=1  OVERWRITE=1  OUT=data/egotouch
 set -eo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
@@ -31,8 +33,14 @@ echo "=== 2/6 extract ==="
 echo "=== 3/6 retarget both hands onto the Wuji Hand ==="
 "$PY_RETARGET" scripts/data/retarget_humantouch.py --data "$OUT" --hz "${HZ:-30}" "${OW[@]}"
 if [ "${SKIP_PARSE:-0}" != "1" ]; then
-    echo "=== 4/6 Gemini scene parsing ==="
-    [ -n "${GEMINI_API_KEY:-}" ] || { echo "GEMINI_API_KEY not set (SKIP_PARSE=1 to cut whole episodes only)"; exit 1; }
+    if [ "${VLM:-gemini}" = "qwen" ]; then
+        echo "=== 4/6 Qwen-VL scene parsing (local) ==="
+        PARSE=("$PY_QWEN" scripts/reconstruction/semantic_parsing.py --backend qwen ${MODEL:+--model "$MODEL"})
+    else
+        echo "=== 4/6 Gemini scene parsing ==="
+        [ -n "${GEMINI_API_KEY:-}" ] || { echo "GEMINI_API_KEY not set (VLM=qwen: a local model; SKIP_PARSE=1: whole episodes only)"; exit 1; }
+        PARSE=("$PY_GEMINI" scripts/reconstruction/semantic_parsing.py --model "${MODEL:-gemini-3.6-flash}")
+    fi
     "$PY_SIM" -c "
 import sys; sys.path.insert(0, 'src')
 from pathlib import Path
@@ -42,8 +50,8 @@ for e in select_episodes('$EGOTOUCH_ROOT', '$EPISODES' or None):
         print(e.key, e.video, context(e), sep='\t')" | while IFS=$'\t' read -r key video ctx; do
         out="$OUT/scene/$key.json"
         if [ -e "$out" ]; then echo "  $key: exists"; continue; fi
-        "$PY_GEMINI" scripts/reconstruction/semantic_parsing.py --video "$video" --out "$out" \
-            --model "${MODEL:-gemini-3.6-flash}" --fps "${GEMINI_FPS:-4}" --context "$ctx" < /dev/null || echo "  $key: parsing failed"
+        "${PARSE[@]}" --video "$video" --out "$out" --fps "${GEMINI_FPS:-4}" --context "$ctx" < /dev/null \
+            || echo "  $key: parsing failed"
     done
 fi
 echo "=== 5/6 cuts + videos ==="

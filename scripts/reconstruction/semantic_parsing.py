@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Semantic parsing of a manipulation video with Gemini (Benchmark-Genesis' Stage 1, extended to clips).
+"""Semantic parsing of a manipulation video with a vision-language model (Benchmark-Genesis' Stage 1,
+extended to clips): Gemini (API) or Qwen-VL (local, --backend qwen).
 
 Input: one video (e.g. a HumanTouch head-camera episode). Output: one JSON file describing the scene,
-made in two Gemini calls on the same uploaded video:
+made in three calls on the same video:
   objects  every object of the workspace with a stable id and what SAM3 needs to segment it: a text
            prompt (`description`) and a time where it is clearly visible (`visible_at_s`); plus a
            material, a shape and a size (physical properties, proxy / RecGen checks);
@@ -13,19 +14,29 @@ made in two Gemini calls on the same uploaded video:
            third call; it sets the simulated hands (scripts/rl/prepare_reference.py: one hand used, a
            one-hand environment). The clips' per-hand objects give the same answer (`hands_in_clips`);
            a disagreement is printed. --hands-only adds it to an existing scene file.
-Gemini samples the video at --fps: clip times are hints to within ~1/fps s, not frame-accurate
+The model samples the video at --fps: clip times are hints to within ~1/fps s, not frame-accurate
 (scripts/data/cut_clips.py pads them; the glove gives the exact grasp inside).
 
-Run in an env with google-genai and imageio-ffmpeg (the `sam3d` conda env); reads GEMINI_API_KEY.
+Backends (same prompts, same schemas, same output):
+  gemini  Google's API, the answer constrained to the schema. An env with google-genai and imageio-ffmpeg (the
+          `sam3d` conda env); reads GEMINI_API_KEY. Free-tier quotas and 503 overloads are per model (--model).
+  qwen    Qwen-VL run locally with transformers (default Qwen/Qwen3-VL-4B-Instruct, ~9 GB downloaded once from
+          Hugging Face, ~10 GB of GPU memory): no key, no quota. The schema is given in the prompt, the answer
+          checked against it and asked again with the errors when it does not match. An env with transformers
+          >= 4.57, qwen-vl-utils and a video reader (the `lerobot` conda env). A small model: check the hands
+          (left / right of the person) and the clip times it gives.
 
     python scripts/reconstruction/semantic_parsing.py --video ~/HumanTouch/X001/videos/chunk-000/observation.images.cam_head/episode_000002.mp4 \
         --out data/humantouch/scene/episode_000002.json
+    python scripts/reconstruction/semantic_parsing.py --backend qwen --video <video> --out <scene.json>
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,9 +44,9 @@ import time
 from pathlib import Path
 
 import imageio_ffmpeg
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from tv2s_data.scene import SUPPORT_WORDS  # noqa: E402
 
 MATERIALS = ["ceramic", "porcelain", "glass", "plastic", "metal", "aluminum", "steel", "wood", "paper",
              "cardboard", "rubber", "fabric", "foam"]
@@ -135,58 +146,171 @@ def small_video(src: Path, dst: Path, height: int) -> float:
     return duration
 
 
-def upload(client: genai.Client, path: Path):
-    f = client.files.upload(file=str(path))
-    while f.state.name == "PROCESSING":
-        time.sleep(2)
-        f = client.files.get(name=f.name)
-    if f.state.name != "ACTIVE":
-        raise RuntimeError(f"upload of {path} failed: {f.state}")
-    return f
+def schema_errors(x, schema: dict, path: str = "$") -> list[str]:
+    """What in `x` does not match `schema` (the JSON-schema subset of this file: types, enums, required)."""
+    t = schema.get("type")
+    ok = {"object": dict, "array": list, "string": str, "boolean": bool}.get(t)
+    if t == "number":
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return [f"{path}: a number expected"]
+    elif ok is not None and not isinstance(x, ok):
+        return [f"{path}: {t} expected"]
+    if "enum" in schema and x not in schema["enum"]:
+        return [f"{path}: {x!r} is not one of {schema['enum']}"]
+    errs = []
+    if t == "object":
+        errs += [f"{path}.{k}: missing" for k in schema.get("required", []) if k not in x]
+        for k, sub in schema.get("properties", {}).items():
+            if k in x:
+                errs += schema_errors(x[k], sub, f"{path}.{k}")
+    elif t == "array" and "items" in schema:
+        for i, v in enumerate(x):
+            errs += schema_errors(v, schema["items"], f"{path}[{i}]")
+    return errs
 
 
-def ask(client: genai.Client, model: str, parts: list, schema: dict) -> dict:
-    config = types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema,
-                                         temperature=0.0)
-    for attempt in range(5):
+class Gemini:
+    """Google's API: the video uploaded once per parse, answers constrained to the schema."""
+
+    def __init__(self, model: str) -> None:
+        from google import genai
+
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            sys.exit("GEMINI_API_KEY not set")
+        self.model, self.client = model, genai.Client(api_key=api_key)
+
+    @contextlib.contextmanager
+    def video(self, src: Path, fps: float, height: int):
+        """(video part, duration s); the upload is deleted afterwards (it would stay 48 h on Google's side)."""
+        from google.genai import types
+
+        with tempfile.TemporaryDirectory() as tmp:
+            small = Path(tmp) / "video.mp4"
+            duration = small_video(src, small, height)
+            f = self.client.files.upload(file=str(small))
+        while f.state.name == "PROCESSING":
+            time.sleep(2)
+            f = self.client.files.get(name=f.name)
+        if f.state.name != "ACTIVE":
+            raise RuntimeError(f"upload of {src} failed: {f.state}")
         try:
-            return json.loads(client.models.generate_content(model=model, contents=parts, config=config).text)
-        except genai_errors.ServerError as e:
-            print(f"attempt {attempt + 1}/5 failed ({e}); retrying...", file=sys.stderr)
-            time.sleep(2 ** attempt)
-    raise RuntimeError("Gemini unavailable")
+            yield types.Part(file_data=types.FileData(file_uri=f.uri, mime_type=f.mime_type),
+                             video_metadata=types.VideoMetadata(fps=fps)), duration
+        finally:
+            self.client.files.delete(name=f.name)
+
+    def ask(self, video, prompt: str, schema: dict, check=None) -> dict:
+        from google.genai import errors as genai_errors
+        from google.genai import types
+
+        config = types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema,
+                                             temperature=0.0)
+        for attempt in range(5):
+            try:
+                return json.loads(self.client.models.generate_content(model=self.model, contents=[video, prompt],
+                                                                      config=config).text)
+            except genai_errors.ServerError as e:
+                print(f"attempt {attempt + 1}/5 failed ({e}); retrying...", file=sys.stderr)
+                time.sleep(2 ** attempt)
+        raise RuntimeError("Gemini unavailable")
 
 
-def uploaded_video(client: genai.Client, src: Path, fps: float, height: int):
-    """(video part, uploaded file, duration s)"""
-    with tempfile.TemporaryDirectory() as tmp:
-        small = Path(tmp) / "video.mp4"
-        duration = small_video(src, small, height)
-        f = upload(client, small)
-    return types.Part(file_data=types.FileData(file_uri=f.uri, mime_type=f.mime_type),
-                      video_metadata=types.VideoMetadata(fps=fps)), f, duration
+class Qwen:
+    """Qwen-VL run locally (transformers): the video read at `fps` (at most `max_frames` frames), the schema in
+    the prompt, the answer parsed and checked, and asked again with the errors (up to `tries` times)."""
+
+    def __init__(self, model: str, max_frames: int = 64, max_new_tokens: int = 4096, tries: int = 3) -> None:
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        print(f"loading {model} (downloaded from Hugging Face the first time)...", file=sys.stderr)
+        self.processor = AutoProcessor.from_pretrained(model)
+        self.net = AutoModelForImageTextToText.from_pretrained(model, dtype=torch.bfloat16, device_map="cuda").eval()
+        self.max_frames, self.max_new_tokens, self.tries = max_frames, max_new_tokens, tries
+
+    @contextlib.contextmanager
+    def video(self, src: Path, fps: float, height: int):
+        """(video message part, duration s): an H.264 copy at `height` px, read at `fps`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            small = Path(tmp) / "video.mp4"
+            duration = small_video(src, small, height)
+            fps = min(fps, self.max_frames / max(duration, 1e-3))
+            yield {"type": "video", "video": str(small), "fps": fps, "max_pixels": 640 * 480}, duration
+
+    def _generate(self, messages: list, sample: bool) -> str:
+        import torch
+        from qwen_vl_utils import process_vision_info
+
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        images, videos, video_kwargs = process_vision_info(messages, image_patch_size=16, return_video_kwargs=True,
+                                                           return_video_metadata=True)
+        metadata = None
+        if videos is not None:
+            videos, metadata = map(list, zip(*videos))
+        inputs = self.processor(text=[text], images=images, videos=videos, video_metadata=metadata, do_resize=False,
+                                return_tensors="pt", **video_kwargs).to(self.net.device)
+        with torch.no_grad():
+            out = self.net.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=sample,
+                                    **({"temperature": 0.3, "top_p": 0.9} if sample else {}))
+        return self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+
+    def ask(self, video, prompt: str, schema: dict, check=None) -> dict:
+        """`check`: the answer -> what else is wrong with it (asked again too)."""
+        prompt = (f"{prompt}\n\nThe JSON schema of the answer:\n{json.dumps(schema)}\n"
+                  "Answer with one JSON object only, no comment, no markdown.")
+        messages = [{"role": "user", "content": [video, {"type": "text", "text": prompt}]}]
+        for attempt in range(self.tries):
+            reply = self._generate(messages, sample=attempt > 0)
+            m = re.search(r"\{.*\}", reply, re.S)
+            try:
+                answer = json.loads(m.group(0)) if m else None
+                errs = schema_errors(answer, schema) if answer is not None else ["no JSON object in the answer"]
+                errs = errs or (check(answer) if check else [])
+            except json.JSONDecodeError as e:
+                answer, errs = None, [f"invalid JSON ({e})"]
+            if not errs:
+                return answer
+            print(f"attempt {attempt + 1}/{self.tries}: the answer does not match the schema ({'; '.join(errs[:5])})",
+                  file=sys.stderr)
+            messages = messages[:1] + [
+                {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+                {"role": "user", "content": [{"type": "text", "text": "This answer does not match the schema: "
+                                              + "; ".join(errs[:10]) + ". Answer again with the corrected JSON only."}]}]
+        raise RuntimeError(f"{self.tries} answers did not match the schema")
 
 
-def ask_hands(client: genai.Client, model: str, video, hint: str, clips: list[dict]) -> dict:
-    """hands_used (Gemini), its reason, and hands_in_clips (from the clips' per-hand objects)."""
-    h = ask(client, model, [video, HANDS_PROMPT + hint], HANDS_SCHEMA)
+def support_listed(scene: dict) -> list[str]:
+    """The camera registration segments the support surface (tv2s_data.scene.support_id): an object named after
+    one (table, desk, ...), static."""
+    if any(any(w in o["id"] for w in SUPPORT_WORDS) and o["is_static"] for o in scene["objects"]):
+        return []
+    return [f"the support surface the objects stand on is missing: list it as an object too, its id containing one "
+            f"of {list(SUPPORT_WORDS)} (e.g. 'table'), with is_static true; objects the hands move have is_static false"]
+
+
+def ask_hands(vlm, video, hint: str, clips: list[dict]) -> dict:
+    """hands_used (the model), its reason, and hands_in_clips (from the clips' per-hand objects)."""
+    h = vlm.ask(video, HANDS_PROMPT + hint, HANDS_SCHEMA)
     in_clips = hands_in_clips(clips)
     if in_clips not in (h["hands_used"], "none"):
         print(f"warning: hands_used {h['hands_used']} but the clips give objects to: {in_clips}", file=sys.stderr)
     return dict(hands_used=h["hands_used"], hands_reason=h["reason"], hands_in_clips=in_clips)
 
 
-def parse_video(client: genai.Client, src: Path, model: str, fps: float, height: int, context: str = "") -> dict:
-    video, f, duration = uploaded_video(client, src, fps, height)
-    try:
+def parse_video(vlm, src: Path, model: str, fps: float, height: int, context: str = "") -> dict:
+    with vlm.video(src, fps, height) as (video, duration):
         hint = f"\n\nContext from the dataset (may be partial): {context}" if context else ""
-        scene = ask(client, model, [video, OBJECTS_PROMPT + hint], OBJECTS_SCHEMA)
+        scene = vlm.ask(video, OBJECTS_PROMPT + hint, OBJECTS_SCHEMA, check=support_listed)
         ids = [o["id"] for o in scene["objects"]]
         prompt = CLIPS_PROMPT.format(duration=duration, objects=json.dumps(scene["objects"], indent=1)) + hint
-        clips = ask(client, model, [video, prompt], clips_schema(ids))["clips"]
-        hands = ask_hands(client, model, video, hint, clips)
-    finally:
-        client.files.delete(name=f.name)          # uploads otherwise stay 48 h on Google's side
+        clips = vlm.ask(video, prompt, clips_schema(ids))["clips"]
+        hands = ask_hands(vlm, video, hint, clips)
+    moved = {c[f"{s}_hand"]["object"] for c in clips for s in ("left", "right")} - {"none"}
+    for o in scene["objects"]:
+        if o["is_static"] and o["id"] in moved:           # a hand manipulates it in a clip: not static
+            print(f"{o['id']}: manipulated in a clip, is_static set to false", file=sys.stderr)
+            o["is_static"] = False
     for c in sorted(clips, key=lambda c: c["start_s"]):
         hs = [c[f"{s}_hand"] for s in ("left", "right")]
         c["objects_manipulated"] = sorted({h["object"] for h in hs} - {"none"})
@@ -195,14 +319,11 @@ def parse_video(client: genai.Client, src: Path, model: str, fps: float, height:
                 scene=scene["scene"], **hands, objects=scene["objects"], clips=sorted(clips, key=lambda c: c["start_s"]))
 
 
-def add_hands(client: genai.Client, scene: dict, model: str, fps: float, height: int) -> dict:
+def add_hands(vlm, scene: dict, fps: float, height: int) -> dict:
     """An existing scene with hands_used added (its objects and clips unchanged)."""
-    video, f, _ = uploaded_video(client, Path(scene["video"]), fps, height)
-    try:
+    with vlm.video(Path(scene["video"]), fps, height) as (video, _):
         hint = f"\n\nContext from the dataset (may be partial): {scene['context']}" if scene.get("context") else ""
-        hands = ask_hands(client, model, video, hint, scene["clips"])
-    finally:
-        client.files.delete(name=f.name)
+        hands = ask_hands(vlm, video, hint, scene["clips"])
     out = {k: v for k, v in scene.items() if k not in ("objects", "clips")}
     return dict(out, **hands, objects=scene["objects"], clips=scene["clips"])
 
@@ -211,10 +332,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--video", required=True, help="the manipulation video")
     ap.add_argument("--out", required=True, help="the scene JSON to write")
-    ap.add_argument("--model", default="gemini-flash-lite-latest",
-                    help="gemini-flash-latest has been persistently 503-overloaded in testing; "
-                         "gemini-flash-lite-latest and gemini-3.6-flash both work reliably")
-    ap.add_argument("--fps", type=float, default=2.0, help="video frames per second Gemini samples")
+    ap.add_argument("--backend", choices=("gemini", "qwen"), default="gemini",
+                    help="gemini: Google's API (GEMINI_API_KEY); qwen: Qwen-VL run locally (transformers)")
+    ap.add_argument("--model", default=None,
+                    help="gemini (default gemini-flash-lite-latest): a model of the API, e.g. gemini-3.6-flash, "
+                         "gemini-3-flash-preview; qwen (default Qwen/Qwen3-VL-4B-Instruct): a Hugging Face "
+                         "Qwen-VL, e.g. Qwen/Qwen2.5-VL-3B-Instruct")
+    ap.add_argument("--max-frames", type=int, default=64, help="qwen: at most this many frames (fps lowered)")
+    ap.add_argument("--fps", type=float, default=2.0, help="video frames per second the model samples")
     ap.add_argument("--height", type=int, default=480, help="height of the uploaded video (px)")
     ap.add_argument("--context", default="", help="what is known about the video (e.g. the dataset's task "
                                                   "and items), given to Gemini with both prompts")
@@ -222,15 +347,17 @@ def main():
                     help="--out exists: only ask which hands are used and add it (objects and clips kept)")
     args = ap.parse_args()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        sys.exit("GEMINI_API_KEY not set")
     src, out = Path(args.video).expanduser(), Path(args.out)
-    client = genai.Client(api_key=api_key)
-    if args.hands_only:
-        scene = add_hands(client, dict(json.loads(out.read_text()), video=str(src)), args.model, args.fps, args.height)
+    if args.backend == "qwen":
+        model = args.model or "Qwen/Qwen3-VL-4B-Instruct"
+        vlm = Qwen(model, max_frames=args.max_frames)
     else:
-        scene = parse_video(client, src, args.model, args.fps, args.height, args.context)
+        model = args.model or "gemini-flash-lite-latest"
+        vlm = Gemini(model)
+    if args.hands_only:
+        scene = add_hands(vlm, dict(json.loads(out.read_text()), video=str(src)), args.fps, args.height)
+    else:
+        scene = parse_video(vlm, src, model, args.fps, args.height, args.context)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(scene, indent=2, ensure_ascii=False))
 
