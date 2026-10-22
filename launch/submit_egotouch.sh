@@ -29,7 +29,7 @@ for KEY in ${KEYS//,/ }; do
     fi
     for T in 1 0; do
         V=$([ $T = 1 ] && echo tac || echo notac)
-        J2=$(NAME="$NAME" EXP="${P}_${NAME}_$V" TACTILE=$T sbatch "${SB[@]}" "${DEP[@]}" -J "${V}_$NAME" --export=ALL \
+        J2=$(KEY="$KEY" NAME="$NAME" EXP="${P}_${NAME}_$V" TACTILE=$T sbatch "${SB[@]}" "${DEP[@]}" -J "${V}_$NAME" --export=ALL \
             launch/slurm/egotouch_rl.slurm)
         echo "    $V: $J2 -> logs/${P}_${NAME}_$V"
     done

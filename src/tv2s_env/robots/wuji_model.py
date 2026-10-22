@@ -42,12 +42,6 @@ def rpy_to_matrix(rpy):
     return Rz @ Ry @ Rx
 
 
-def axis_angle(axis, angle):
-    axis = np.asarray(axis, float) / np.linalg.norm(axis)
-    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-    return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
-
-
 def _origin(element):
     o = element.find("origin") if element is not None else None
     xyz = np.array([float(v) for v in o.get("xyz", "0 0 0").split()]) if o is not None else np.zeros(3)

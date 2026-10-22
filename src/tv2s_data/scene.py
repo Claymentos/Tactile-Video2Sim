@@ -12,3 +12,13 @@ def support_id(scene: dict) -> str:
     named = [i for i in ids if any(w in i for w in SUPPORT_WORDS)]
     static = [o["id"] for o in scene["objects"] if o.get("is_static")]
     return (named or static or ["table"])[0]
+
+
+def manipulated_object(scene: dict) -> dict:
+    """The object the hands manipulate (the one a single-object reconstruction rebuilds): the first one that is
+    neither static nor the support."""
+    sup = support_id(scene)
+    moved = [o for o in scene["objects"] if o["id"] != sup and not o.get("is_static")]
+    if not moved:
+        raise ValueError(f"no manipulated object in the scene: {[o['id'] for o in scene['objects']]}")
+    return moved[0]

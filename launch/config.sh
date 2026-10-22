@@ -4,7 +4,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HUMANTOUCH_ROOT="${HUMANTOUCH_ROOT:-${SCRATCH:-$HOME}/HumanTouch/X001}"            # one HumanTouch task folder
 TOUCHSCALE_ROOT="${TOUCHSCALE_ROOT:-${SCRATCH:-$HOME}/TouchScale}"                 # TouchScale (shards extracted in data/)
 EGOTOUCH_ROOT="${EGOTOUCH_ROOT:-${SCRATCH:-$HOME}/EgoTouch}"                     # EgoTouch (scripts/data/download_egotouch.py)
-DATA_DIR="${DATA_DIR:-$REPO/data/humantouch}"                          # prepared episodes, retargeting, clips
+ACE_ROOT="${ACE_ROOT:-${SCRATCH:-$HOME}/ACE-Data-0}"                           # ACE-Data-0 (gated hub dataset)
+ACE_EPISODES="${ACE_EPISODES:-$REPO/data/ace/episodes}"                      # scripts/data/extract_ace.py's episode folders
+DATA_DIR="${DATA_DIR:-$REPO/data/humantouch}"                          # prepared HumanTouch episodes
 # Jean Zay layout ($WORK / $SCRATCH) when those exist, else the original home-directory layout
 if [ -n "${WORK:-}" ] && [ -d "$WORK/ext/wuji-retargeting" ]; then
     export WUJI_RETARGETING_DIR="${WUJI_RETARGETING_DIR:-$WORK/ext/wuji-retargeting}"
@@ -22,8 +24,12 @@ PY_RETARGET="${PY_RETARGET:-$CONDA_BASE/envs/wuji_retargeting/bin/python}"   # p
 PY_SIM="${PY_SIM:-$CONDA_BASE/envs/genesis/bin/python}"                # genesis-world, torch, trimesh
 PY_GEMINI="${PY_GEMINI:-$CONDA_BASE/envs/sam3d/bin/python}"            # google-genai (semantic_parsing.py)
 PY_QWEN="${PY_QWEN:-$CONDA_BASE/envs/lerobot/bin/python}"              # transformers + qwen-vl-utils (semantic_parsing.py --backend qwen)
-PY_SAM3="${PY_SAM3:-$CONDA_BASE/envs/sam3/bin/python}"                 # SAM3 video segmentation
+PY_SAM3="${PY_SAM3:-$CONDA_BASE/envs/sam3/bin/python}"                 # SAM3 video segmentation, CoTracker, ffmpeg
 PY_MOGE="${PY_MOGE:-$CONDA_BASE/envs/moge/bin/python}"                 # MoGe metric depth
 PY_RECGEN="${PY_RECGEN:-$CONDA_BASE/envs/recgen/bin/python}"           # RecGen meshes
-PY_FP="${PY_FP:-$CONDA_BASE/envs/foundationpose/bin/python}"          # FoundationPose tracking
+PY_HAWOR="${PY_HAWOR:-$CONDA_BASE/envs/hawor/bin/python}"              # HaWoR hands from the video (reconstruct.sh HANDS=hawor)
+export HAWOR_DIR="${HAWOR_DIR:-$HOME/do-as-i-do/reconstruction/modules/HaWoR}"   # HaWoR checkout
 export RECGEN_DIR="${RECGEN_DIR:-$HOME/recgen}"                          # RecGen checkout
+RECGEN_CHECKPOINT="${RECGEN_CHECKPOINT:-recgen_base.multiview_stereo}"    # RecGen model (reconstruct.sh)
+MOGE_CHECKPOINT="${MOGE_CHECKPOINT:-Ruicheng/moge-3-vitl}"               # MoGe model (reconstruct.sh)
+MOGE_REPO="${MOGE_REPO:-$HOME/MoGe}"                                      # MoGe checkout, when not installed in its env

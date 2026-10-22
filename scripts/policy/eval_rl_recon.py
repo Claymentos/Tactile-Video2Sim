@@ -92,7 +92,7 @@ def main() -> None:
     run = latest_run_dir(REPO / "logs" / args.exp_name)
     env_args = load_env_args(run / "configs" / "env_args.json")
     if env_args.env_name != "RlReconEnv":
-        raise SystemExit(f"{run}: env {env_args.env_name}, not rl_recon (scripts/policy/run_ppo_recon.py --eval)")
+        raise SystemExit(f"{run}: env {env_args.env_name}, not an rl_recon run")
     ckpts = sorted((run / "checkpoints").glob("checkpoint_*.pt"))
     if args.checkpoint:
         p = Path(args.checkpoint)

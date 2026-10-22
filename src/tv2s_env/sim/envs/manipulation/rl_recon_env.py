@@ -51,7 +51,6 @@ import genesis as gs
 import numpy as np
 import torch
 
-from tv2s_data.glove import GloveLayout, load_glove_layout
 from tv2s_data.reference import load_reference
 from tv2s_env.common.bases.base_env import BaseEnv
 from tv2s_env.common.utils.math_utils import matrix_to_rotvec, quat_to_rotmat, rotation_angle
@@ -65,21 +64,11 @@ HAND_KEYS = ("wrist_pos", "wrist_rot", "qpos", "base_R0", "base_q", "ref_keypoin
 OBJECT_KEYS = ("obj_pos", "obj_rot", "obj_valid", "object_ids", "object_collision", "object_fixed", "object_mass", "obj_rest_z")
 
 
-def load_taxels(path: str, side: str, glove_layout: str | None) -> tuple[TaxelSet, GloveLayout]:
-
+def load_taxels(path: str, side: str) -> TaxelSet:
+    """The glove's taxels on the Wuji links (Benchmark-Genesis' wuji_taxels_<side>.npz)."""
     z = np.load(path, allow_pickle=False)
-    if "raw_ids" not in z.files:
-        return TaxelSet.load(path), load_glove_layout(glove_layout, side)
-    n = len(z["raw_ids"])
-    first = np.array([np.flatnonzero(z["channel"] == c)[0] if (z["channel"] == c).any() else 0 for c in range(n)])
-    rc, region = z["cell_rc"][first], z["region"][first].astype(str)
-    region = np.where(region == "little", "pinky", region)
-    layout = GloveLayout(side=side, channels=z["raw_ids"], rows=rc[:, 0], cols=rc[:, 1], region=region,
-                         u=np.where(region == "palm", 0.5, 1.0), v=np.full(n, 0.5), n_raw=int(z["raw_ids"].max()) + 1,
-                         grid_shape=(int(rc[:, 0].max()) + 1, int(rc[:, 1].max()) + 1))
-    taxels = TaxelSet(side=side, method="benchmark_genesis", link=z["link"].astype(str), pos=z["pos"], normal=z["normal"],
-                      channel=z["channel"], n_channels=n)
-    return taxels, layout
+    return TaxelSet(side=side, method="benchmark_genesis", link=z["link"].astype(str), pos=z["pos"], normal=z["normal"],
+                    channel=z["channel"], n_channels=len(z["raw_ids"]))
 
 
 class RlReconEnv(BaseEnv):
@@ -128,7 +117,6 @@ class RlReconEnv(BaseEnv):
         ref = {k: (np.moveaxis(v, 0, 1) if k not in ("base_R0",) else v) for k, v in ref.items()}   # (T, H, ...)
         self.base_R0 = {s: ref["base_R0"][h] for h, s in enumerate(self.sides)}
         self.taxel_paths = [str(r["taxels"][i]) for i in keep]
-        self.glove_layout_path = str(r["glove_layout"]) if "glove_layout" in r else None
         self.human_kp_index = torch.as_tensor(r["human_kp_index"], device=self.device)
 
         # objects (T, N, ...)
@@ -141,6 +129,8 @@ class RlReconEnv(BaseEnv):
         ref["obj_pos"] = np.moveaxis(r["obj_pos"][:, :T], 0, 1)
         ref["obj_rot"] = np.moveaxis(r["obj_rot"][:, :T], 0, 1)
         ref["obj_valid"] = np.moveaxis(r["obj_valid"][:, :T], 0, 1)
+        ref["obj_weight"] = np.moveaxis(r["obj_weight"][:, :T], 0, 1)                    # (T, N)
+        ref["obj_margin_scale"] = np.moveaxis(r["obj_margin_scale"][:, :T], 0, 1)
         ref["obj_quat"] = np.stack([_rotmats_to_quats(ref["obj_rot"][:, k]) for k in range(N)], 1)
         ref["head_pos"] = np.asarray(r["cam_pos"])[:T]
         meshes = [trimesh.load(p, force="mesh") for p in self.collision_paths]
@@ -331,16 +321,12 @@ class RlReconEnv(BaseEnv):
 
     def _build_sensors(self) -> None:
         t = self._args.tactile
-        self.sensors, self.layouts = [], []
-        for h, s in enumerate(self.sides):
-            taxels, layout = load_taxels(self.taxel_paths[h], s, self.glove_layout_path)
-            self.layouts.append(layout)
-            self.sensors.append(GloveSensor(taxels, layout, self.hands[h].link_index, t.probe_radius, t.kn, self.device))
+        self.sensors = [GloveSensor(load_taxels(self.taxel_paths[h], s), self.hands[h].link_index, t.probe_radius, t.kn,
+                                    self.device) for h, s in enumerate(self.sides)]
         if len({s.n_channels for s in self.sensors}) > 1:
             raise ValueError(f"the hands' gloves have different channel counts: {[s.n_channels for s in self.sensors]}")
         self.n_channels = self.sensors[0].n_channels
         self.sdf = [MeshDistance(p, self.device, voxel=self._args.sdf_voxel, signed=True) for p in self.collision_paths]
-        self.tactile_pixel_weights = torch.stack([s.to_image(s.channel_weights[None])[0] for s in self.sensors])
         self._clear_starts()
 
     @torch.no_grad()
@@ -486,6 +472,9 @@ class RlReconEnv(BaseEnv):
 
         task = self.task_t.float()                                                          # (N,)
         valid = self.ref_at("obj_valid", t).float() * task                                  # (B, N)
+        # the reference's per-frame weight and margin scale of the object terms (keyframe_object_trajectory: strict
+        # where the object's pose is measured, loose while it is only assumed in the hand)
+        weight, mscale = self.ref_at("obj_weight", t), self.ref_at("obj_margin_scale", t)
         n_task = task.sum()
         err = self.all_object_pos - self.target_all_object_pos                              # (B, N, 3)
         along = (err * self.camera_ray).sum(-1)
@@ -494,16 +483,20 @@ class RlReconEnv(BaseEnv):
         e_obj_rot = rotation_angle(self.all_object_rot.transpose(-1, -2) @ self.target_all_object_rot)
         axis_img = self._image_axis((self.all_object_rot @ self.obj_axis[None, :, :, None])[..., 0], self.camera_ray)
         e_axis = 2 * torch.asin(((axis_img - self.ref_at("axis_img", t)).norm(dim=-1) / 2).clamp(max=1.0))
+        valid_axis = valid * weight
         if self.mask_axis is not None:
             tt = t.clamp(0, self.T - 1)
             e_mask = torch.acos((self._pixel_axis(self.all_object_rot, self.all_object_pos, t) * self.mask_axis[tt]).sum(-1).clamp(-1, 1))
             e_axis = torch.where(self.mask_valid[tt], e_mask, e_axis)
-        hinge_pos = ((across - a.obj_margin_across).clamp(min=0) / a.obj_scale_across
-                     + (along.abs() - a.obj_margin_along).clamp(min=0) / a.obj_scale_along)
+            # the masks' axis is measured in the image itself: it scores the frames the reference trajectory leaves
+            # out too (a reference whose object target is set on its measured frames only)
+            valid_axis = torch.maximum(valid * weight, self.mask_valid[tt].float() * task)
+        hinge_pos = ((across - a.obj_margin_across * mscale).clamp(min=0) / a.obj_scale_across
+                     + (along.abs() - a.obj_margin_along * mscale).clamp(min=0) / a.obj_scale_along)
         hinge_rot = ((e_axis - a.obj_axis_margin).clamp(min=0) / a.obj_axis_scale
-                     + a.obj_rot_weight * (e_obj_rot - a.obj_rot_margin).clamp(min=0) / 0.5)
-        p_pos = ((1 - torch.exp(-hinge_pos)) * valid).sum(-1) / n_task
-        p_axis = ((1 - torch.exp(-hinge_rot)) * valid).sum(-1) / n_task
+                     + valid * weight * a.obj_rot_weight * (e_obj_rot - a.obj_rot_margin).clamp(min=0) / 0.5)
+        p_pos = ((1 - torch.exp(-hinge_pos)) * valid * weight).sum(-1) / n_task
+        p_axis = ((1 - torch.exp(-hinge_rot)) * valid_axis).sum(-1) / n_task
         mean_task = lambda x: (x * task).sum(-1) / n_task
         return dict(r_hand=r_hand, r_tac=r_tac, p_pos=p_pos, p_axis=p_axis, f1_soft=f1_soft.mean(-1),
                     e_wrist_h=e_wrist, e_kp_h=e_kp, e_obj_task=e_obj * valid,
@@ -524,18 +517,10 @@ class RlReconEnv(BaseEnv):
         return total, terms
 
     def common_metrics(self) -> dict[str, torch.Tensor]:
-        """What evaluate_policy and the runner log (BimanualTactileEnv.common_metrics' keys) plus rl_recon's."""
-        from tv2s_env.common.rewards.dextag_terms import WeightedGaussianBlurredTactileMapSimilarityReward
+        """What the runner logs and eval_rl_recon.py scores: rl_recon's terms and errors."""
         m = self._metrics
-        if not hasattr(self, "_map_metric"):
-            self._map_metric = WeightedGaussianBlurredTactileMapSimilarityReward()
-        sim_map = torch.stack([s.to_image(self.tactile_pressure[:, h]) for h, s in enumerate(self.sensors)], 1)
-        ref_map = torch.stack([s.to_image(self.target_pressure[:, h] * self.target_contact[:, h]) for h, s in enumerate(self.sensors)], 1)
-        sim = self._map_metric.similarity(sim_map, ref_map, self.tactile_pixel_weights)       # (B, H)
-        has = (self.target_contact.sum(-1) > 0).float()
         return dict(
             tac_tp=m["tac_tp"], tac_sim=m["tac_sim"], tac_real=m["tac_real"],
-            tac_map_similarity=(sim * has).sum(-1) / has.sum(-1).clamp(min=1),
             f1_soft=m["f1_soft"], r_tac=m["r_tac"], r_hand=m["r_hand"], p_pos=m["p_pos"], p_axis=m["p_axis"],
             e_wrist=m["e_wrist_h"].mean(-1), e_rot=m["e_rot"], e_kp=m["e_kp_h"].mean(-1), e_human=m["e_human"],
             e_tip=(self.finger_link_pos - self.target_fingertip_pos).norm(dim=-1).mean((-1, -2)),

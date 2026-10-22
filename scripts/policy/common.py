@@ -1,5 +1,4 @@
-"""Helpers shared by the training scripts (DexTaG's scripts/policy/utils.py, plus the evaluation both
-methods are scored with).
+"""Helpers shared by the training and evaluation scripts (DexTaG's scripts/policy/utils.py).
 
 Command line: `--key=value` pairs. Known script arguments are passed to main(); the others are config
 overrides in dot notation, routed by prefix: --env.<field>, --reward_args.<Term>.<arg>, --algo.<field>,
@@ -18,7 +17,7 @@ import torch
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
-# paths in the configs (clips, tactile assets, logs) are relative to the repository root
+# paths in the configs (references, tactile assets, logs) are relative to the repository root
 os.chdir(REPO)
 
 
@@ -261,81 +260,7 @@ def create_env(env_args: Any, num_envs: int, device: str = "cuda", eval_mode: bo
                                             camera_res=camera_res)
 
 
-@torch.no_grad()
-def evaluate_policy(env: Any, policy: Any, out_path: Path | None = None, place_tol: float = 0.06) -> dict[str, Any]:
-    """One deterministic episode per environment (the eval env has one env per clip), aids off.
-
-    The same metrics for both methods: success (the episode reached the clip end with every object within
-    `place_tol` of its reference there: in the hand, or put down on its placing support), completion (fraction
-    of the clip played before termination), contact precision / recall / F1 of the simulated glove
-    against the real one, the glove-image similarity (DexTaG's reward without its scale), and the palm,
-    fingertip and object errors against the reference."""
-    B = env.num_envs
-    env.reset()
-    obs, _ = env.get_observations()
-    running = torch.ones(B, dtype=torch.bool, device=env.device)
-    keys = ["tac_tp", "tac_sim", "tac_real", "tac_map_similarity", "e_wrist", "e_tip", "e_kp", "e_obj", "obj_valid"]
-    sums = {k: torch.zeros(B, device=env.device) for k in keys + ["reward", "obj_frames", "map_frames"]}
-    steps = torch.zeros(B, device=env.device)
-    success = torch.zeros(B, dtype=torch.bool, device=env.device)
-    start = env.start.clone()
-    length = (env.horizon - env.start).float().clamp(min=1)
-    while running.any():
-        action, _ = policy(obs, deterministic=True)
-        obs, _, reward, terminated, truncated, info = env.step(action)
-        m, r = info["metrics"], running.float()
-        for k in keys:
-            if k == "e_obj":
-                sums[k] += m[k] * m["obj_valid"] * r
-            elif k == "tac_map_similarity":
-                sums[k] += m[k] * (m["tac_real"] > 0) * r
-            else:
-                sums[k] += m[k] * r
-        sums["obj_frames"] += m["obj_valid"] * r
-        sums["map_frames"] += (m["tac_real"] > 0).float() * r
-        sums["reward"] += reward[:, 0] * r
-        steps += r
-        done = (terminated | truncated)[:, 0] & running
-        reached_end = truncated[:, 0] | info["termination"].get("succeeded", torch.zeros_like(done))
-        success |= done & reached_end & (m["e_obj_end"] < place_tol)
-        running &= ~done
-    per_clip = []
-    for i in range(B):
-        tp, ns, nr = (sums[k][i].item() for k in ("tac_tp", "tac_sim", "tac_real"))
-        p, rc = tp / max(ns, 1), tp / max(nr, 1)
-        per_clip.append(dict(
-            clip=env.clip_names[int(env.env_clip[i])], start=int(start[i]), steps=int(steps[i]),
-            success=bool(success[i]), completion=min(1.0, steps[i].item() / length[i].item()),
-            reward=sums["reward"][i].item() / max(steps[i].item(), 1),
-            tac_precision=p, tac_recall=rc, tac_f1=2 * p * rc / max(p + rc, 1e-9),
-            tac_map_similarity=sums["tac_map_similarity"][i].item() / max(sums["map_frames"][i].item(), 1),
-            e_wrist_cm=100 * sums["e_wrist"][i].item() / max(steps[i].item(), 1),
-            e_tip_mm=1000 * sums["e_tip"][i].item() / max(steps[i].item(), 1),
-            e_obj_cm=100 * sums["e_obj"][i].item() / max(sums["obj_frames"][i].item(), 1),
-        ))
-    summary = {k: float(np.mean([c[k] for c in per_clip])) for k in per_clip[0] if k not in ("clip", "start", "steps")}
-    result = dict(summary=summary, clips=per_clip)
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(result, indent=1))
-    return result
-
-
-def print_eval(result: dict[str, Any], header: str = "") -> None:
-    s = result["summary"]
-    print(f"\n{'=' * 100}\n{header}")
-    print(f"{'clip':<22} {'succ':>5} {'compl':>6} {'F1':>5} {'P':>5} {'R':>5} {'map':>5} {'wrist cm':>8} "
-          f"{'tip mm':>7} {'obj cm':>7}")
-    for c in result["clips"]:
-        print(f"{c['clip']:<22} {int(c['success']):>5} {c['completion']:>6.2f} {c['tac_f1']:>5.2f} "
-              f"{c['tac_precision']:>5.2f} {c['tac_recall']:>5.2f} {c['tac_map_similarity']:>5.2f} "
-              f"{c['e_wrist_cm']:>8.1f} {c['e_tip_mm']:>7.0f} {c['e_obj_cm']:>7.1f}")
-    print(f"{'MEAN':<22} {s['success']:>5.2f} {s['completion']:>6.2f} {s['tac_f1']:>5.2f} {s['tac_precision']:>5.2f} "
-          f"{s['tac_recall']:>5.2f} {s['tac_map_similarity']:>5.2f} {s['e_wrist_cm']:>8.1f} {s['e_tip_mm']:>7.0f} "
-          f"{s['e_obj_cm']:>7.1f}\n{'=' * 100}")
-
-
-# ====================================================================== train / evaluate
+# ====================================================================== train
 def build_configs(method: str, env_name: str, env_ov: dict, algo_ov: dict, runner_ov: dict) -> tuple[Any, Any, Any]:
     from tv2s_agent.algos.config.registry import AlgoArgsRegistry
     from tv2s_agent.runners.config.registry import RunnerArgsRegistry
@@ -348,18 +273,6 @@ def build_configs(method: str, env_name: str, env_ov: dict, algo_ov: dict, runne
     algo = apply_overrides_generic(AlgoArgsRegistry[method], algo_ov, prefixes=("algo.",))
     runner = apply_overrides_generic(RunnerArgsRegistry[method], runner_ov, prefixes=("runner.",))
     return env_args, algo, runner
-
-
-def fit_networks(algo: Any, env: Any) -> Any:
-    """Fill the temporal encoders' input splits from the env's observation layout (DexTaG)."""
-    from tv2s_agent.modules.config.schema import TemporalEncoderConfig
-
-    upd = {}
-    for role, key in (("actor", "policy_backbone"), ("critic", "critic_backbone")):
-        cfg = getattr(algo, key)
-        if isinstance(cfg, TemporalEncoderConfig):
-            upd[key] = cfg.with_layout(env.obs_layout(role))
-    return algo.model_copy(update=upd)
 
 
 def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_overrides: tuple,
@@ -377,7 +290,6 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
     env_args, algo, runner_args = build_configs(method, env_name, *cli_overrides)
     seed_everything(env_args.seed)
     env = create_env(env_args, num_envs, device)
-    algo = fit_networks(algo, env)
     ppo = PPO(env, algo, torch.device(device))
     start = 0
     if resume_checkpoint:
@@ -412,46 +324,3 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
             logger.finish()
     (run_dir / "TRAINING_DONE").touch()
     print(f"Training done: {summary['iterations']} iterations in {summary['total_time'] / 60:.1f} min")
-
-
-def count_clips(env_args: Any) -> int:
-    """Number of clips the env will load (the eval env has one env per clip)."""
-    from tv2s_env.sim.envs.manipulation.bimanual_tactile_env import select_clip_names
-    return len(select_clip_names(env_args.data))
-
-
-def evaluate_run(method: str, exp_name: str, checkpoint: str | None = None, all_checkpoints: bool = False,
-                 split_mode: str | None = None, env_overrides: dict | None = None, device: str = "cuda") -> None:
-    """Evaluate a trained run on every selected clip (one env per clip). `all_checkpoints` scores every
-    checkpoint of the run and copies the best one (by contact F1, then completion) to model_best.pt, as
-    Benchmark-Genesis' recon_rsl_eval.py --all."""
-    import shutil
-
-    from tv2s_agent.algos.config.schema import PPOArgs
-    from tv2s_agent.algos.ppo import PPO
-    from tv2s_env.sim.envs.config.schema import load_env_args
-
-    run_dir = latest_run_dir(REPO / "logs" / exp_name)
-    env_args = load_env_args(run_dir / "configs" / "env_args.json")
-    if split_mode:
-        env_args = env_args.model_copy(update={"data": env_args.data.model_copy(update={"split_mode": split_mode})})
-    env_args = apply_overrides_generic(env_args, env_overrides or {}, prefixes=("env.",))
-    algo = load_config(PPOArgs, run_dir / "configs" / "algo_cfg.json")
-    ckpts = sorted((run_dir / "checkpoints").glob("checkpoint_*.pt"))
-    if checkpoint:
-        ckpts = [Path(checkpoint)]
-    elif not all_checkpoints:
-        ckpts = ckpts[-1:]
-    env = create_env(env_args, num_envs=count_clips(env_args), device=device, eval_mode=True)
-    ppo = PPO(env, algo, torch.device(device))
-    best, best_key = None, None
-    for ck in ckpts:
-        ppo.load(ck, load_optimizer=False)
-        res = evaluate_policy(env, ppo.get_inference_policy(), run_dir / "eval" / f"{ck.stem}.json")
-        print_eval(res, f"{exp_name} / {ck.name} ({len(res['clips'])} clips, split {env_args.data.split_mode})")
-        key = (round(res["summary"]["tac_f1"], 3), res["summary"]["completion"])
-        if best_key is None or key > best_key:
-            best, best_key = ck, key
-    if all_checkpoints and best is not None:
-        shutil.copy(best, run_dir / "checkpoints" / "model_best.pt")
-        print(f"best: {best.name} (F1 {best_key[0]:.3f}, completion {best_key[1]:.2f}) -> model_best.pt")

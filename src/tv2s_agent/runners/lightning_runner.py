@@ -7,8 +7,7 @@ warm-up). The losses, the KL-adaptive learning rate, the normalisers and the che
 (tv2s_agent.algos.ppo), so a run of either runner is evaluated the same way (checkpoints/checkpoint_*.pt).
 
 Logging: wandb from the module (`self.logger.experiment`, a WandbLogger's run) when TV2S_WANDB=1, x axis the
-PPO iteration, plus the rollout videos as they appear; progress.csv and TensorBoard as OnPolicyRunner
-(MetricLogger without wandb), so the report scripts read both runners' runs.
+PPO iteration; progress.csv and TensorBoard as OnPolicyRunner (MetricLogger without wandb).
 """
 
 import json
@@ -26,7 +25,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from tv2s_agent.runners.config.schema import RunnerArgs
-from tv2s_agent.runners.onpolicy_runner import MetricLogger, flatten, iteration_summary, new_rollout_videos
+from tv2s_agent.runners.onpolicy_runner import MetricLogger, flatten, iteration_summary
 
 
 class PPOLightningModule(L.LightningModule):
@@ -41,7 +40,6 @@ class PPOLightningModule(L.LightningModule):
         self.start_iteration = start_iteration
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self._videos_logged: set[str] = set()
         self._env_steps = 0
         self._last_log = start_iteration - 1
         self._tic = time.time()
@@ -112,16 +110,9 @@ class PPOLightningModule(L.LightningModule):
         if run is not None:
             run.log({"iteration": it, "progress/env_steps": self._env_steps,
                      "progress/wall_hours": (time.time() - self._tic) / 3600,
-                     **flat, **new_rollout_videos(self.run_dir, self._videos_logged)})
+                     **flat})
         self.csv_logger.dump(it, flat)
         print("\n" + iteration_summary(it, info, time.time() - self._tic), flush=True)
-
-    def on_train_end(self) -> None:
-        run = self.wandb_run
-        if run is not None:
-            videos = new_rollout_videos(self.run_dir, self._videos_logged)
-            if videos:
-                run.log(videos)
 
 
 def rng_state() -> dict[str, Any]:

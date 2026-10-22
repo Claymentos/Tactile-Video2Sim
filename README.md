@@ -196,12 +196,14 @@ Runs go to `logs/<exp>/<timestamp>/` (`configs/`, `checkpoints/`, `progress.csv`
 3. PPO trains on the env `rl_recon` (`rl_recon_env.py`). It follows `env.py` term by term: on a Benchmark-Genesis reference, the observation has the same 681 values.
 4. `scripts/policy/eval_rl_recon.py` scores every checkpoint as `train.py` does (from frame 0 and in hand, no assist, no termination, over 32 envs) and keeps `model_best.pt` / `model_best_inhand.pt`.
 
-The reference has two sources:
-- **`BG_RECON=<dir>`**: Benchmark-Genesis' own reconstruction of the video, through its own chain (retargeting, `prepare_reference.py`, `mask_axes.py`, `tactile_grasp_pose.py`, `select_grasp_pose.py`). It handles one hand only.
+The reference has three sources:
+- **`EGOTOUCH=<key>`** (recommended for EgoTouch, where it trained best): the episode is reconstructed by Benchmark-Genesis' own chain, `launch/reconstruct_bg.sh` (its `run_touchanything_pipeline.sh`, unchanged: camera motion from CoTracker on the table, the mocap placed on the episode's WiLoR 2D joints and the depth, the depth rescaled into the mocap's metres, RecGen without mask erosion, CoTracker + Kalman object trajectory), on the object the scene file says the hands manipulate; then as `BG_RECON`. Needs the Benchmark-Genesis checkout (`BG_RECON_ROOT`) and its conda envs.
+- **`BG_RECON=<dir>`**: an existing Benchmark-Genesis reconstruction of the video, through its own reference chain (retargeting, `prepare_reference.py`, `mask_axes.py`, `tactile_grasp_pose.py`, `select_grasp_pose.py`, the last one keeping the in-hand pose the hand holds under physics). It handles one hand only.
 - **`CLIP=<pkl>`**: an episode clip of this pipeline. It can have both hands and several objects.
 
 ```bash
-export GEMINI_API_KEY=...
+export GEMINI_API_KEY=...                  # or VLM=qwen
+EGOTOUCH=pick_up_screwdriver__20260321_103227_213 launch/rl_recon.sh et_screwdriver_bg   # Gemini, reconstruction, reference, PPO, eval
 BG=~/Benchmark-Genesis/reconstruction/human_videos/touchanything/pick_up_screwdriver_103227
 BG_RECON=$BG launch/rl_recon.sh screwdriver_103227 $BG/pick_up_screwdriver_rgb.mp4      # ITERATIONS=2000 N_ENVS=2048
 # a fine-tune of a checkpoint (train.py --resume --reset-iterations), e.g. rl_recon's v18 stage:

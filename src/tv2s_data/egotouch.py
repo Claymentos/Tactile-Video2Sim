@@ -8,8 +8,10 @@ One episode is one short bimanual task (~3-30 s, 213 tasks under Home/Office/Out
   pressure_grids.npz               both tactile gloves on a 21x21 hand-shaped grid, normalised to [0, 1],
                                    baseline-corrected (NaN off the glove)
   jq_pressure.json                 the raw gloves (256 8-bit cells per hand) and their IMU quaternions
-  masks.npz                        both gloves' masks in chest.mp4 (track 0: left, 1: right; not in every episode)
-  wilor_hands.json, hamer_hands.json   video hand estimates (camera frame, not aligned), unused
+  masks.npz                        both gloves' masks in chest.mp4 (track 0: right, 1: left; not in every episode)
+  wilor_hands.json                 WiLoR's hand joints in chest.mp4 (camera frame, not aligned): the 2D joints
+                                   Benchmark-Genesis' reconstruction places the mocap with (launch/reconstruct_bg.sh)
+  hamer_hands.json                 HaMeR's, unused
 (*.json are JSON lines, one per frame.)
 
 Frames. Both Rokoko and Vive record in left-handed worlds (a skeleton read as right-handed has the other
@@ -52,7 +54,7 @@ CONTACT_THRESHOLD = 0.1
 NOMINAL_HFOV_DEG = 50.0      # no intrinsics in the dataset: a start for register_camera.py's focal fit
 TRACKERS = ("chest", "left_wrist", "right_wrist")
 FILES = ("chest.mp4", "left.mp4", "right.mp4", "rokoko_hands.json", "vive_poses.json", "pressure_grids.npz",
-         "jq_pressure.json", "masks.npz", "manual_contact_annotation.json")
+         "jq_pressure.json", "masks.npz", "manual_contact_annotation.json", "wilor_hands.json")
 LAYOUT_JSON = Path(__file__).resolve().parents[2] / "assets" / "tactile" / "egotouch_glove.json"
 
 # the left glove's grid (module docstring); the right glove's column c is the left's 20 - c
@@ -186,28 +188,6 @@ def quality(data: dict[str, np.ndarray]) -> dict[str, float]:
     """Share of valid frames of every stream (an episode is usable with both hands' skeletons valid; the
     chest track places a moving camera)."""
     return {k[:-6]: round(float(v.mean()), 3) for k, v in data.items() if k.endswith("_valid")}
-
-
-def video_size(ep: Episode) -> tuple[int, int]:
-    import cv2
-
-    cap = cv2.VideoCapture(str(ep.video))
-    size = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    return size
-
-
-def glove_masks(ep: Episode) -> np.ndarray | None:
-    """(2, T, H, W) bool masks of the left and right glove in chest.mp4, None if the episode has none."""
-    if not (ep.dir / "masks.npz").exists():
-        return None
-    z = np.load(ep.dir / "masks.npz")
-    m = z["masks"].astype(bool)
-    if "obj_ids" not in z.files:
-        return np.moveaxis(m[:, :2], 1, 0)
-    ids = z["obj_ids"]                                     # per frame and slot; a slot keeps its glove
-    slot = [int(np.bincount(np.clip(ids[:, j], 0, None)).argmax()) if (ids[:, j] >= 0).any() else -1 for j in range(ids.shape[1])]
-    return np.stack([m[:, slot.index(k)] if k in slot else np.zeros_like(m[:, 0]) for k in range(2)])
 
 
 # ================================================================================ glove

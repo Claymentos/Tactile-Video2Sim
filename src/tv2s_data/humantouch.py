@@ -131,16 +131,6 @@ def camera_from_head(extrinsics: dict) -> np.ndarray:
     return m
 
 
-def _quat_xyzw_to_matrix(q: np.ndarray) -> np.ndarray:
-    q = q / np.linalg.norm(q, axis=-1, keepdims=True)
-    x, y, z, w = np.moveaxis(q, -1, 0)
-    return np.stack([
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
-        np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
-        np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1),
-    ], -2)
-
-
 def extract_episode(root: str | Path, episode_index: int, zup: bool = True) -> dict[str, np.ndarray]:
     """Read one episode's parquet into dense float32 / bool arrays (needs pandas + pyarrow).
     `zup` converts Unity's world to a right-handed z-up frame (see the module docstring)."""
@@ -166,12 +156,3 @@ def extract_episode(root: str | Path, episode_index: int, zup: bool = True) -> d
     out["episode_index"] = np.array(episode_index)
     out["fps"] = np.array(FPS)
     return out
-
-
-def mediapipe_keypoints(skeleton: np.ndarray) -> np.ndarray:
-    """(T, 25, 3) HumanTouch skeleton -> (T, 21, 3) MediaPipe keypoints."""
-    return skeleton[:, MEDIAPIPE_FROM_SKELETON]
-
-
-def quat_xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
-    return q[..., [3, 0, 1, 2]]

@@ -74,12 +74,6 @@ def context(ep: Episode) -> str:
             f"Items: {', '.join(m.get('items', []))}.")
 
 
-def frame_times(ep: Episode) -> np.ndarray:
-    """Timestamp (s, epoch) of every frame of rgb_head.mp4."""
-    with open(ep.path("rgb_head.csv")) as f:
-        return np.array([float(r["timestamp_s"]) for r in csv.DictReader(f)])
-
-
 def pad_shapes(ep: Episode) -> dict[str, list[int]]:
     """Taxel grid of every glove pad, in the order the taxels are flattened (glove_at_frames)."""
     import h5py
@@ -107,33 +101,3 @@ def glove_at_frames(ep: Episode, side: str, times: np.ndarray) -> dict[str, np.n
     i = np.clip(np.searchsorted(t, times), 1, len(t) - 1)
     i -= (times - t[i - 1]) < (t[i] - times)                          # nearest of the two neighbours
     return {k: v[i].astype(np.float32) for k, v in out.items()}
-
-
-def contact_counts(ep: Episode, times: np.ndarray | None = None) -> dict[str, np.ndarray]:
-    """Per hand, the number of taxels in contact at every video frame (or at `times`)."""
-    times = frame_times(ep) if times is None else times
-    return {s: (glove_at_frames(ep, s, times)["force"] > CONTACT_FORCE_N).sum(1) for s in SIDES}
-
-
-def contact_intervals(count: np.ndarray, fps: float = FPS, min_s: float = 0.3, gap_s: float = 0.2) -> list[tuple[int, int]]:
-    """Sustained contacts [a, b) in frames: at least CONTACT_MIN_TAXELS taxels, gaps under `gap_s`
-    bridged, runs shorter than `min_s` dropped."""
-    on = np.r_[False, count >= CONTACT_MIN_TAXELS, False]
-    edges = np.flatnonzero(np.diff(on.astype(int)))
-    runs = []
-    for a, b in zip(edges[::2], edges[1::2]):
-        if runs and a - runs[-1][1] < gap_s * fps:
-            runs[-1] = (runs[-1][0], b)
-        else:
-            runs.append((a, b))
-    return [(int(a), int(b)) for a, b in runs if b - a >= min_s * fps]
-
-
-def task_window(ep: Episode) -> tuple[int, int]:
-    """The task segment [start, end) in video frames (task/seg_start..seg_end of the h5, in its frames)."""
-    import h5py
-
-    with h5py.File(ep.path("episode.h5")) as f:
-        src = f["obs/video/rgb_head/src_idx"][:]
-        s, e = int(f["task/seg_start"][()]), int(f["task/seg_end"][()])
-    return int(src[s]), int(src[min(e, len(src) - 1)]) + 1
