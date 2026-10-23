@@ -26,10 +26,12 @@ PY_GEMINI="${PY_GEMINI:-$CONDA_BASE/envs/sam3d/bin/python}"            # google-
 PY_QWEN="${PY_QWEN:-$CONDA_BASE/envs/lerobot/bin/python}"              # transformers + qwen-vl-utils (semantic_parsing.py --backend qwen)
 PY_SAM3="${PY_SAM3:-$CONDA_BASE/envs/sam3/bin/python}"                 # SAM3 video segmentation, CoTracker, ffmpeg
 PY_MOGE="${PY_MOGE:-$CONDA_BASE/envs/moge/bin/python}"                 # MoGe metric depth
+PY_DA3="${PY_DA3:-$HOME/venvs/da3/bin/python}"                         # Depth-Anything-3 depth (reconstruct.sh DEPTH=da3): a venv over the moge env, ~/Depth-Anything-3 installed
 PY_RECGEN="${PY_RECGEN:-$CONDA_BASE/envs/recgen/bin/python}"           # RecGen meshes
 PY_HAWOR="${PY_HAWOR:-$CONDA_BASE/envs/hawor/bin/python}"              # HaWoR hands from the video (reconstruct.sh HANDS=hawor)
 export HAWOR_DIR="${HAWOR_DIR:-$HOME/do-as-i-do/reconstruction/modules/HaWoR}"   # HaWoR checkout
 export RECGEN_DIR="${RECGEN_DIR:-$HOME/recgen}"                          # RecGen checkout
 RECGEN_CHECKPOINT="${RECGEN_CHECKPOINT:-recgen_base.multiview_stereo}"    # RecGen model (reconstruct.sh)
 MOGE_CHECKPOINT="${MOGE_CHECKPOINT:-Ruicheng/moge-3-vitl}"               # MoGe model (reconstruct.sh)
+DA3_CHECKPOINT="${DA3_CHECKPOINT:-depth-anything/DA3METRIC-LARGE}"     # Depth-Anything-3 model (reconstruct.sh DEPTH=da3)
 MOGE_REPO="${MOGE_REPO:-$HOME/MoGe}"                                      # MoGe checkout, when not installed in its env

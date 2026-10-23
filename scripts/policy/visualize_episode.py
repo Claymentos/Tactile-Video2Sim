@@ -15,6 +15,8 @@ simulated glove, the per-frame errors -- the reconstructed episode) and <tag>.js
 
     python scripts/policy/visualize_episode.py --exp et_screwdriver [--checkpoint best|best_inhand|latest|N] [--start in_hand]
     python scripts/policy/visualize_episode.py --reference data/references/et_screwdriver/reference.npz
+  --run logs/<exp>/<time> --checkpoint path/to/checkpoint.pt: a given run and checkpoint (the training's videos:
+  tv2s_agent.runners.rollout_videos)
 """
 
 import argparse
@@ -33,11 +35,13 @@ CV_TO_GL = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 def load_policy(env, algo_args, run: Path, checkpoint: str):
-    """The inference policy of a checkpoint: best (model_best.pt), best_inhand, latest, or a number."""
+    """The inference policy of a checkpoint: best (model_best.pt), best_inhand, latest, a number or a .pt path."""
     from tv2s_agent.algos.ppo import PPO
     ck = run / "checkpoints"
     named = {"best": "model_best.pt", "best_inhand": "model_best_inhand.pt"}
-    if checkpoint in named and (ck / named[checkpoint]).exists():
+    if checkpoint.endswith(".pt"):
+        path = Path(checkpoint)
+    elif checkpoint in named and (ck / named[checkpoint]).exists():
         path = ck / named[checkpoint]
     elif checkpoint in ("best", "best_inhand", "latest"):
         path = sorted(ck.glob("checkpoint_*.pt"))[-1]
@@ -55,7 +59,8 @@ def main() -> None:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--exp", help="rl_recon run to replay")
     src.add_argument("--reference", help="play this reference itself (no policy)")
-    ap.add_argument("--checkpoint", default="best", help="best, best_inhand, latest, or a number")
+    ap.add_argument("--run", default=None, help="--exp: this run directory (default: the latest of logs/<exp>)")
+    ap.add_argument("--checkpoint", default="best", help="best, best_inhand, latest, a number, or a .pt path")
     ap.add_argument("--start", choices=("first", "in_hand"), default="first")
     ap.add_argument("--height", type=int, default=300, help="panel height (px)")
     ap.add_argument("--out", default=str(REPO / "outputs" / "episodes"))
@@ -66,7 +71,7 @@ def main() -> None:
         tag = f"{Path(args.reference).parent.name}_reference"
     else:
         from tv2s_agent.algos.config.schema import PPOArgs
-        run = latest_run_dir(REPO / "logs" / args.exp)
+        run = Path(args.run) if args.run else latest_run_dir(REPO / "logs" / args.exp)
         env_args = load_env_args(run / "configs" / "env_args.json").model_copy(update={"eval_start": args.start})
         algo_args = load_config(PPOArgs, run / "configs" / "algo_cfg.json")
         tag = f"{args.exp}_{args.start}"

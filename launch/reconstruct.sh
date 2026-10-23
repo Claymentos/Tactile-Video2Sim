@@ -7,7 +7,9 @@
 #   1  frames      every frame of chest.mp4                                                         [PY_SAM3: ffmpeg]
 #   2  sam3        video masks of the object (text prompt) and of the table; when the text misses the table at the
 #                  reference frame, points picked on the table found later (table_points.py)      [PY_SAM3]
-#   3  depth       intrinsics from MoGe on the reference frame, MoGe metric depth of every frame     [PY_MOGE]
+#   3  depth       intrinsics from MoGe on the reference frame, metric depth of every frame: MoGe, or with DEPTH=da3
+#                  Depth-Anything-3 (DA3METRIC-LARGE, steadier over time: estimate_depth_da3.py), written in the same
+#                  depth_moge/ folder and format                                                  [PY_MOGE, PY_DA3]
 #   4  camera      the camera's motion: CoTracker points on the table, lifted with the depth, Kabsch [PY_SAM3, PY_SIM]
 #   5  mocap       the Rokoko hands placed in the reference camera by one similarity fitted on the episode's WiLoR
 #                  2D joints (those lying on the other hand's glove dropped: masks.npz), the gloves' masks (where
@@ -23,6 +25,10 @@
 #   7  mesh        RecGen from the reference frame's RGB, depth and mask, without mask erosion       [PY_RECGEN]
 #   8  object      CoTracker points on the object, lifted, Kabsch, composed with the camera motion into the
 #                  reference camera, Kalman-smoothed                                                  [PY_SAM3, PY_SIM]
+#   9  contact     (HAND_CONTACT=1) the hands' depth corrected along their camera rays so that the glove touches the
+#                  object at rest when it grasps it and lets it go: MoGe's near / far depth disagree (the screwdriver:
+#                  the glove 14 cm in front of the object it touches); the image projection is unchanged
+#                  (hand_object_contact.py: mocap_joints_cotracker_raw.npz kept, hand_contact.json)  [PY_SIM]
 # The object (its SAM3 prompt) and the reference frame come from the scene file (semantic_parsing.py): the object
 # the hands manipulate, when it is first visible. Then: scripts/rl/prepare_reference.py --recon <out> (or
 # launch/rl_recon.sh, which runs this first), scripts/reconstruction/replay_raw_genesis.py --reference.
@@ -47,13 +53,17 @@
 #          HAND_KNOT_FRAMES=10 (smooth)  HAND_POSE_SMOOTH=4 (frames)  HAND_DEPTH=moge|pnp
 #          HANDS=mocap|hawor (default: mocap on EgoTouch, hawor on ACE)  HAND_PROMPT="black glove" (SAM3, HANDS=hawor)
 #          HAND_PER_FRAME_DEPTH=0 (keep HaWoR's own per-frame depth)
+#          DEPTH=moge|da3 (step 3's depth model; video.json records it)
 #          RECGEN_EROSION=1  SAM3_OFFLOAD=1  SMOOTH_WINDOW=9
+#          HAND_CONTACT=1 (step 9)  CONTACT_ARGS="--touch-contacts 2 --finger-radius 0.01" (hand_object_contact.py)
 #          SKIP_FRAMES=1 SKIP_SAM3=1 SKIP_DEPTH=1 SKIP_CAMERA=1 SKIP_MOCAP=1 SKIP_MESH=1 SKIP_OBJECT=1
 set -eo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 cd "$REPO"
 KEY="${1:?usage: launch/reconstruct.sh KEY [OUT]}"
 DATASET="${DATASET:-egotouch}"
+DEPTH="${DEPTH:-moge}"
+case "$DEPTH" in moge|da3) ;; *) echo "DEPTH=moge|da3" >&2; exit 1 ;; esac
 case "$DATASET" in
     egotouch) HANDS="${HANDS:-mocap}" ;;
     ace) HANDS="${HANDS:-hawor}" ;;
@@ -105,8 +115,11 @@ HAND_PROMPT="${HAND_PROMPT:-$([ "$DATASET" = ace ] && echo "black glove" || echo
 HAND_ID=hands
 mkdir -p "$OUT"
 ln -sfn "$EP_DIR" "$OUT/source"
-echo "{\"fps\": $FPS, \"dataset\": \"$DATASET\", \"hands\": \"$HANDS\"}" > "$OUT/video.json"
-echo "=== $KEY ($DATASET, $FPS fps, hands: $HANDS): object '$OBJECT', reference frame $n -> $OUT ==="
+if [ "${SKIP_DEPTH:-0}" = "1" ] && [ -e "$OUT/video.json" ]; then     # the depth kept: the model that made it
+    DEPTH="$("$PY_SIM" -c "import json,sys; print(json.load(open(sys.argv[1])).get('depth', 'moge'))" "$OUT/video.json")"
+fi
+echo "{\"fps\": $FPS, \"dataset\": \"$DATASET\", \"hands\": \"$HANDS\", \"depth\": \"$DEPTH\"}" > "$OUT/video.json"
+echo "=== $KEY ($DATASET, $FPS fps, hands: $HANDS, depth: $DEPTH): object '$OBJECT', reference frame $n -> $OUT ==="
 
 VIDEO_PATH="$OUT/${TASK}_rgb.mp4"
 FRAMES_DIR="$OUT/all_frames"
@@ -165,15 +178,20 @@ for mask in "$REF_MASKS/$OBJ_ID.png" "$REF_MASKS/$STATIC_ID.png"; do
     mask_ok "$mask" || { echo "empty mask at the reference frame: $mask (FRAME=, OBJECT=, TABLE_POINTS=)" >&2; exit 1; }
 done
 
-echo "=== 3/8 intrinsics and depth (MoGe) ==="
+echo "=== 3/8 intrinsics (MoGe) and depth ($DEPTH) ==="
 INTRINSICS_INFO="$(in_env "$PY_MOGE" $R/estimate_intrinsics_moge.py --image "$FRAME_PATH" --checkpoint "$MOGE_CHECKPOINT" \
     "${MOGE_REPO_ARG[@]}" --out "$INTRINSICS_YAML")"
 echo "$INTRINSICS_INFO"
 FOV_X="$(sed -n 's/^FOV_X=//p' <<< "$INTRINSICS_INFO")"
 if [ "${SKIP_DEPTH:-0}" != "1" ]; then
     rm -rf "$DEPTH_DIR" "${DEPTH_DIR}_raw"          # a fresh depth pass invalidates any earlier rescale
-    in_env "$PY_MOGE" $R/estimate_depth_moge.py --frames-dir "$FRAMES_DIR" --out-dir "$DEPTH_DIR" --fov-x "$FOV_X" \
-        --checkpoint "$MOGE_CHECKPOINT" "${MOGE_REPO_ARG[@]}"
+    if [ "$DEPTH" = "da3" ]; then
+        in_env "$PY_DA3" $R/estimate_depth_da3.py --frames-dir "$FRAMES_DIR" --out-dir "$DEPTH_DIR" \
+            --intrinsics "$INTRINSICS_YAML" --checkpoint "$DA3_CHECKPOINT"
+    else
+        in_env "$PY_MOGE" $R/estimate_depth_moge.py --frames-dir "$FRAMES_DIR" --out-dir "$DEPTH_DIR" --fov-x "$FOV_X" \
+            --checkpoint "$MOGE_CHECKPOINT" "${MOGE_REPO_ARG[@]}"
+    fi
 fi
 
 track_rigid() {  # MASK_NAME POINTS_OUT POSES_OUT SMOOTHER
@@ -205,6 +223,7 @@ place_hands() {  # [--fixed-scale S]
 }
 if [ "${SKIP_MOCAP:-0}" != "1" ]; then
     echo "=== 5/8 $HANDS hands (${HAND_SIDES:-left right}) into the reference camera ==="
+    rm -f "$OUT/mocap_joints_cotracker_raw.npz" "$OUT/hand_contact.json"   # a new placement: step 9's input is stale
     if [ "$HANDS" = "hawor" ]; then
         in_env "$PY_HAWOR" $R/estimate_hands_hawor.py --frames-dir "$FRAMES_DIR" --intrinsics "$INTRINSICS_YAML" \
             --work "$OUT/hawor" --instances "$MASKS_ROOT/instances_$HAND_ID.npz"
@@ -239,5 +258,11 @@ if [ "${SKIP_OBJECT:-0}" != "1" ]; then
     "$PY_SIM" $R/compose_camera_motion.py --object-traj "$OBJ_TRAJ_CAM" --camera-traj "$CAMERA_TRAJ" \
         --intrinsics "$INTRINSICS_YAML" --out "$OBJ_TRAJ_COMPOSED"
     "$PY_SIM" $R/smooth_object_kalman.py --traj "$OBJ_TRAJ_COMPOSED" --mesh "$MESH" --out "$OBJ_TRAJ"
+fi
+if [ "${HAND_CONTACT:-0}" = "1" ]; then
+    echo "=== 9 hands' depth from the glove's contacts with the object ==="
+    SCENE_ARG=(); [ -e "$SCENE" ] && SCENE_ARG=(--scene "$SCENE")
+    # shellcheck disable=SC2086
+    "$PY_SIM" $R/hand_object_contact.py --recon "$OUT" --object "$OBJ_ID" --episode "$EP_DIR" "${SCENE_ARG[@]}" ${CONTACT_ARGS:-}
 fi
 echo "reconstruction: $OUT   check: hands_wilor_check.mp4, video_segmentation/tracked_*.mp4, ${OBJ_ID}_points_cotracker.mp4"

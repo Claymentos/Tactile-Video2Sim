@@ -286,6 +286,7 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
 
     from tv2s_agent.algos.ppo import PPO
     from tv2s_agent.runners.onpolicy_runner import MetricLogger, OnPolicyRunner
+    from tv2s_agent.runners.rollout_videos import RolloutVideos
 
     env_args, algo, runner_args = build_configs(method, env_name, *cli_overrides)
     seed_everything(env_args.seed)
@@ -305,6 +306,8 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
     save_config(algo, run_dir / "configs" / "algo_cfg.json")
     save_config(runner_args, run_dir / "configs" / "runner_args.json")
     print(f"Run directory: {run_dir}")
+    videos = RolloutVideos(REPO / "scripts" / "policy" / "visualize_episode.py", exp_name, run_dir,
+                           runner_args.video_interval, start=env_args.eval_start) if runner_args.video_interval > 0 else None
     mapping = env_args.tactile.mapping
     wandb_init = dict(name=exp_name, group=os.environ.get("WANDB_RUN_GROUP") or None,
                       job_type="train", tags=[method, mapping, env_name],
@@ -314,12 +317,12 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
                                   trainer="lightning" if lightning else "onpolicy"))
     if lightning:
         from tv2s_agent.runners.lightning_runner import train_lightning
-        summary = train_lightning(ppo, runner_args, run_dir, wandb_init, start_iteration=start)
+        summary = train_lightning(ppo, runner_args, run_dir, wandb_init, start_iteration=start, videos=videos)
     else:
         runner = OnPolicyRunner(ppo, runner_args, run_dir)
         logger = MetricLogger(run_dir, wandb_init)
         try:
-            summary = runner.train(logger, start_iteration=start)
+            summary = runner.train(logger, start_iteration=start, videos=videos)
         finally:
             logger.finish()
     (run_dir / "TRAINING_DONE").touch()

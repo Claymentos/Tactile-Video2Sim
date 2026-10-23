@@ -62,6 +62,15 @@ class MetricLogger:
             for k, v in metrics.items():
                 self._tb.add_scalar(k, v, step)
 
+    def log_videos(self, videos: list[tuple[int, Path]]) -> None:
+        """(iteration, mp4) pairs -> wandb rollout/video (RolloutVideos)."""
+        if self._wandb is None:
+            return
+        import wandb
+
+        for it, mp4 in videos:
+            self._wandb.log({"iteration": it, "rollout/video": wandb.Video(str(mp4), format="mp4")})
+
 
 def iteration_summary(it: int, info: dict[str, Any], elapsed_s: float) -> str:
     """One stdout line per logged iteration."""
@@ -85,7 +94,8 @@ class OnPolicyRunner:
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    def train(self, logger: MetricLogger, start_iteration: int = 0) -> dict[str, Any]:
+    def train(self, logger: MetricLogger, start_iteration: int = 0, videos: Any = None) -> dict[str, Any]:
+        """`videos`: a RolloutVideos, a video of the policy every videos.interval iterations."""
         env = self.algorithm.env
         total = self.args.total_iterations
         tic = time.time()
@@ -99,8 +109,15 @@ class OnPolicyRunner:
                 last_log = it
                 logger.dump(it, flat)
                 print(iteration_summary(it, info, time.time() - tic), flush=True)
-            if (it + 1) % self.args.save_interval == 0 or it == total - 1:
+                if videos is not None:
+                    logger.log_videos(videos.finished())
+            video = videos is not None and videos.due(it)
+            if (it + 1) % self.args.save_interval == 0 or it == total - 1 or video:
                 path = self.checkpoint_dir / f"checkpoint_{it + 1:05d}.pt"
                 self.algorithm.save(path)
                 print(f"Checkpoint saved: {path}")
+                if video:
+                    videos.launch(it, path)
+        if videos is not None:
+            logger.log_videos(videos.finished(wait=True))
         return dict(total_time=time.time() - tic, iterations=total - start_iteration)

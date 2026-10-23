@@ -30,7 +30,7 @@ from tv2s_agent.runners.onpolicy_runner import MetricLogger, flatten, iteration_
 
 class PPOLightningModule(L.LightningModule):
     def __init__(self, ppo: Any, runner_args: RunnerArgs, run_dir: Path, csv_logger: MetricLogger,
-                 start_iteration: int = 0) -> None:
+                 start_iteration: int = 0, videos: Any = None) -> None:
         super().__init__()
         self.automatic_optimization = False
         self.ppo, self.args, self.run_dir = ppo, runner_args, Path(run_dir)
@@ -38,6 +38,7 @@ class PPOLightningModule(L.LightningModule):
         self.actor, self.critic = ppo._actor, ppo._critic
         self.csv_logger = csv_logger
         self.start_iteration = start_iteration
+        self.videos = videos                  # a RolloutVideos (rollout_videos.py), or None
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self._env_steps = 0
@@ -97,10 +98,24 @@ class PPOLightningModule(L.LightningModule):
         self.log("tac_f1", info["metrics"]["tac_f1"], prog_bar=True, logger=False)
         if it % self.args.log_interval == 0 or it == total - 1:
             self._log_iteration(it, info)
-        if (it + 1) % self.args.save_interval == 0 or it == total - 1:
+        video = self.videos is not None and self.videos.due(it)
+        if (it + 1) % self.args.save_interval == 0 or it == total - 1 or video:
             path = self.checkpoint_dir / f"checkpoint_{it + 1:05d}.pt"
             ppo.save(path)
             print(f"Checkpoint saved: {path}")
+            if video:
+                self.videos.launch(it, path)
+
+    def log_videos(self, wait: bool = False) -> None:
+        """The rollout videos rendered so far -> wandb rollout/video, at their checkpoint's iteration."""
+        if self.videos is None:
+            return
+        done, run = self.videos.finished(wait), self.wandb_run
+        if run is not None and done:
+            import wandb
+
+            for it, mp4 in done:
+                run.log({"iteration": it, "rollout/video": wandb.Video(str(mp4), format="mp4")})
 
     def _log_iteration(self, it: int, info: dict[str, Any]) -> None:
         flat = flatten(info)
@@ -113,6 +128,7 @@ class PPOLightningModule(L.LightningModule):
                      **flat})
         self.csv_logger.dump(it, flat)
         print("\n" + iteration_summary(it, info, time.time() - self._tic), flush=True)
+        self.log_videos()
 
 
 def rng_state() -> dict[str, Any]:
@@ -143,11 +159,11 @@ def wandb_logger(run_dir: Path, wandb_init: dict | None):
 
 
 def train_lightning(ppo: Any, runner_args: RunnerArgs, run_dir: Path, wandb_init: dict | None,
-                    start_iteration: int = 0) -> dict[str, Any]:
-    """PPO trained by a Lightning Trainer (one epoch = every remaining iteration)."""
+                    start_iteration: int = 0, videos: Any = None) -> dict[str, Any]:
+    """PPO trained by a Lightning Trainer (one epoch = every remaining iteration); `videos`: a RolloutVideos."""
     warnings.filterwarnings("ignore", ".*does not have many workers.*")
     csv_logger = MetricLogger(run_dir)                    # progress.csv + TensorBoard, no wandb
-    module = PPOLightningModule(ppo, runner_args, run_dir, csv_logger, start_iteration)
+    module = PPOLightningModule(ppo, runner_args, run_dir, csv_logger, start_iteration, videos)
     logger = wandb_logger(run_dir, wandb_init)
     trainer = L.Trainer(
         accelerator="gpu" if ppo.device.type == "cuda" else "cpu", devices=1, max_epochs=1, logger=logger,
@@ -157,6 +173,7 @@ def train_lightning(ppo: Any, runner_args: RunnerArgs, run_dir: Path, wandb_init
     tic = time.time()
     try:
         trainer.fit(module)
+        module.log_videos(wait=True)
     finally:
         if logger:
             logger.experiment.finish()
