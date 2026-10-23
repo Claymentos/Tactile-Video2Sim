@@ -30,6 +30,38 @@ class HandArgs(BaseModel):
     kd_range: tuple[float, float] = (1.0, 1.0)
 
 
+class ArmArgs(BaseModel):
+    """Each Wuji hand on a Franka Panda (franka_wuji.py) instead of the virtual base: off by default."""
+    model_config = frozen_config()
+    enabled: bool = False
+    urdf: str | None = None                  # Panda without gripper; None: Genesis' urdf/panda_bullet/panda_nohand.urdf
+    # mount: the palm frame on the flange (z along the forearm, as the palm's fingers), `mount_offset` m out of it
+    mount_offset: float = 0.02
+    mount_yaw: float | None = None           # rad about the flange axis; None: the best of 0, +-90, 180 deg by IK
+    # base on the table (z = 0): None places it by IK over the clip (candidates behind the wrist trajectory, on
+    # the side of the head, `base_distance` m from its centre), else this (x, y) and yaw
+    base_xy: tuple[float, float] | None = None
+    base_yaw: float | None = None
+    base_distance: tuple[float, ...] = (0.35, 0.45, 0.55, 0.65)
+    base_lateral: tuple[float, ...] = (-0.2, -0.1, 0.0, 0.1, 0.2)
+    rest_q: tuple[float, ...] = (0.0, -0.3, 0.0, -2.2, 0.0, 2.0, 0.785)   # IK posture bias (Panda's ready pose)
+    # PD (Genesis' Franka examples) and the Panda's torque limits
+    kp: tuple[float, ...] = (4500.0, 4500.0, 3500.0, 3500.0, 2000.0, 2000.0, 2000.0)
+    kv: tuple[float, ...] = (450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0)
+    effort: tuple[float, ...] = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
+    # action: residual on the joint reference (the clip's palm poses by IK) at t+1 (rad)
+    action_scale: tuple[float, ...] = (0.05, 0.05, 0.05, 0.05, 0.1, 0.1, 0.1)
+    # reward terms (rl_recon_env.py: arm_*)
+    w_posture: float = 0.3                   # exp(-|q - q_ref| / sigma_posture): the IK posture (elbow)
+    sigma_posture: float = 0.3
+    w_limit: float = 0.5                     # joints within limit_margin of their limits
+    limit_margin: float = 0.15
+    w_velocity: float = 0.05                 # (dq / velocity limit)^2
+    w_torque: float = 0.05                   # (torque / effort)^2
+    w_table: float = 1.0                     # arm links below table_clearance (m) above the table
+    table_clearance: float = 0.08            # link frames sit on the joint axes, ~6 cm inside the links' surface
+
+
 class TactileArgs(BaseModel):
     """The simulated glove: the reference's taxels (Benchmark-Genesis' glove cells carried onto the Wuji links)."""
     model_config = frozen_config()
@@ -56,6 +88,7 @@ class RlReconEnvArgs(BaseModel):
     seed: int = 3
     data: ReferenceDataArgs = ReferenceDataArgs()
     hands: HandArgs = HandArgs()
+    arm: ArmArgs = ArmArgs()                   # enabled: each hand on a Franka Panda (--env.arm.enabled=True)
     tactile: TactileArgs = TactileArgs(mapping="mano")   # probe radius, soft contact; the taxels are the reference's
     substeps: int = 4
     work_dir: str = "outputs/urdf"

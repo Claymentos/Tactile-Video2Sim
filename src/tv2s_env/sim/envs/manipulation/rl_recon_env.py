@@ -40,6 +40,16 @@ ReconEnv term by term, per hand, objects averaged (rl_recon: one hand, one objec
                palm frame with its target and long axis, the simulated glove (soft contact, distance), the glove
                contacts 1 and 5 frames ahead, the keypoint errors; the phase first and the last action last.
 
+Franka arm (`arm.enabled`, franka_wuji.py): each hand on a Panda standing on the table instead of the virtual base.
+  The base and the hand's turn on the flange are placed by IK over the clip, whose joint trajectory is the arm's
+  reference: the action's first 7 values per hand are a residual on it (arm.action_scale rad), the observation
+  adds the arm joints and their error to the reference at t+1, and the reward adds
+                 w_posture exp(-|q - q_ref| / sigma_posture) - w_limit p_limit - w_velocity p_velocity
+                 - w_torque p_torque - w_table p_table
+               p_limit the joints' depth into their last limit_margin rad, p_velocity (dq / Panda velocity limit)^2,
+               p_torque (torque / effort)^2 (joint means, hands averaged), p_table the lowest of links 3-7 below
+               table_clearance (fraction of it).
+
 Additions for this pipeline's references, off on Benchmark-Genesis' (`start_clearance` of the reference): starts
 need the reference taxels `start_clearance` away from every resting object (else it is ejected at the reset).
 """
@@ -56,6 +66,7 @@ from tv2s_env.common.bases.base_env import BaseEnv
 from tv2s_env.common.utils.math_utils import matrix_to_rotvec, quat_to_rotmat, rotation_angle
 from tv2s_env.sim.envs.config.schema import RlReconEnvArgs
 from tv2s_env.sim.robots.floating_hands import FloatingWujiHand
+from tv2s_env.sim.robots.franka_wuji import FrankaWujiHand, place_arm
 from tv2s_env.tactile.mapping import TaxelSet
 from tv2s_env.tactile.mesh_sdf import MeshDistance
 from tv2s_env.tactile.sensor import GloveSensor
@@ -218,6 +229,20 @@ class RlReconEnv(BaseEnv):
                 self.rsi_hold[int(t)] = i
         self.rsi_frames = np.array(sorted(self.rsi_hold), int)
 
+        # Franka arms: base, mount and joint reference of each hand's arm, by IK over the clip
+        self.arm_placement = []
+        if a.arm.enabled:
+            for h, s in enumerate(self.sides):
+                pl = place_arm(a.arm, ref["wrist_pos"][:, h], ref["wrist_rot"][:, h], ref["head_pos"], ref["obj_pos"][0])
+                self.arm_placement.append(pl)
+                B = pl["base"]
+                print(f"  {s} Panda at ({B[0, 3]:.2f}, {B[1, 3]:.2f}) yaw {np.degrees(np.arctan2(B[1, 0], B[0, 0])):.0f} deg, hand "
+                      f"turned {np.degrees(pl['mount_yaw']):.0f} deg ({pl['candidates']} candidates): IK error "
+                      f"{pl['e_pos'].mean() * 100:.2f} cm / {np.degrees(pl['e_rot'].mean()):.1f} deg mean, "
+                      f"{pl['e_pos'].max() * 100:.2f} cm / {np.degrees(pl['e_rot'].max()):.1f} deg max")
+            ref["arm_q"] = np.stack([pl["q"] for pl in self.arm_placement], 1)                  # (T, H, 7)
+            ref["arm_dq"] = np.gradient(ref["arm_q"], axis=0) * self.hz                         # fed forward
+
         # tensors (1, T, ...): ref[key][env_clip, t] reads every env's frame
         f = lambda x: torch.as_tensor(np.asarray(x), dtype=torch.float32, device=self.device)[None]
         self.ref = {k: f(v) for k, v in ref.items() if k not in ("holding", "held", "focus", "obj_valid")}
@@ -262,7 +287,13 @@ class RlReconEnv(BaseEnv):
             show_viewer=show_viewer,
         )
         self.scene.add_entity(gs.morphs.Plane())
-        self.hands = [FloatingWujiHand(self.scene, s, self.base_R0[s], a.hands, a.work_dir, self.device) for s in self.sides]
+        if a.arm.enabled:
+            self.hands = [FrankaWujiHand(self.scene, s, self.arm_placement[h]["base"], self.arm_placement[h]["mount"], a.hands,
+                                         a.arm, a.work_dir, self.device) for h, s in enumerate(self.sides)]
+        else:
+            self.hands = [FloatingWujiHand(self.scene, s, self.base_R0[s], a.hands, a.work_dir, self.device) for s in self.sides]
+        self.n_base = self.hands[0].n_base                                                  # arm or virtual base dofs
+        self.base_key = "arm_q" if a.arm.enabled else "base_q"
         self.scene_entities = []
         for k, path in enumerate(self.collision_paths):
             p, R = self.ref["obj_pos"][0, 0, k].cpu().numpy(), self.ref["obj_rot"][0, 0, k].cpu().numpy()
@@ -365,11 +396,11 @@ class RlReconEnv(BaseEnv):
         self.t = torch.zeros(B, dtype=torch.long, device=dev)
         self.start = torch.zeros(B, dtype=torch.long, device=dev)
         self.horizon = torch.full((B,), self.T - 1, dtype=torch.long, device=dev)
-        self.action_dim = 26 * self.H
+        self.action_dim = (self.n_base + 20) * self.H
         self.last_action = torch.zeros(B, self.action_dim, device=dev)
         self.action_rate = torch.zeros(B, device=dev)
-        self.action_scale = torch.tensor([a.action_scale_pos] * 3 + [a.action_scale_rot] * 3
-                                         + [a.action_scale_finger] * 20, device=dev).repeat(self.H)
+        base_scale = list(a.arm.action_scale) if a.arm.enabled else [a.action_scale_pos] * 3 + [a.action_scale_rot] * 3
+        self.action_scale = torch.tensor(base_scale + [a.action_scale_finger] * 20, device=dev).repeat(self.H)
         self.rest_frames_t = torch.as_tensor(self.rest_frames, device=dev)
         self.rsi_frames_t = torch.as_tensor(self.rsi_frames, device=dev)
         self._extra_info: dict[str, Any] = {}
@@ -400,8 +431,12 @@ class RlReconEnv(BaseEnv):
         st = [hand.state() for hand in self.hands]
         stack = lambda k: torch.stack([s[k] for s in st], 1)
         q, dq = stack("q"), stack("dq")
-        self.hand_dof_pos, self.hand_dof_vel = q[..., 6:], dq[..., 6:]
-        self.base_dof_vel = dq[..., :6]
+        nb = self.n_base
+        self.hand_dof_pos, self.hand_dof_vel = q[..., nb:], dq[..., nb:]
+        self.base_dof_vel = dq[..., :nb]
+        if self._args.arm.enabled:
+            self.arm_q, self.arm_dq, self.arm_tau = q[..., :nb], dq[..., :nb], stack("force")[..., :nb]
+            self.arm_link_z = stack("arm_link_z")                                          # (B, H, links)
         self.base_pos, self.base_rot, self.base_quat = stack("palm_pos"), stack("palm_rot"), stack("palm_quat")
         self.keypoints, self.finger_link_pos = stack("keypoints"), stack("tip_pos")
         E = self.scene_entities
@@ -498,19 +533,36 @@ class RlReconEnv(BaseEnv):
         p_pos = ((1 - torch.exp(-hinge_pos)) * valid * weight).sum(-1) / n_task
         p_axis = ((1 - torch.exp(-hinge_rot)) * valid_axis).sum(-1) / n_task
         mean_task = lambda x: (x * task).sum(-1) / n_task
-        return dict(r_hand=r_hand, r_tac=r_tac, p_pos=p_pos, p_axis=p_axis, f1_soft=f1_soft.mean(-1),
+        out = dict(r_hand=r_hand, r_tac=r_tac, p_pos=p_pos, p_axis=p_axis, f1_soft=f1_soft.mean(-1),
                     e_wrist_h=e_wrist, e_kp_h=e_kp, e_obj_task=e_obj * valid,
                     e_rot=e_rot.mean(-1), e_human=e_human.mean(-1), e_axis=mean_task(e_axis),
                     e_obj_across=mean_task(across), e_obj_along=mean_task(along.abs()), e_obj_depth=mean_task(e_obj),
                     e_obj_3d=mean_task(err.norm(dim=-1)), e_obj_3d_max=(err.norm(dim=-1) * task).amax(-1),
                     obj_height=mean_task(self.all_object_pos[..., 2] - self.ref["obj_pos"][0, 0, :, 2]),
                     tac_tp=tp.sum(-1), tac_sim=sim_contact.sum((-1, -2)).float(), tac_real=n_y.sum(-1))
+        if a.arm.enabled:
+            arm, hand = a.arm, self.hands[0]
+            e_arm_q = (self.arm_q - self.ref_at("arm_q", t)).norm(dim=-1)                  # (B, H)
+            margin = torch.minimum(self.arm_q - hand.arm_low, hand.arm_high - self.arm_q)
+            out.update(
+                r_arm_posture=torch.exp(-e_arm_q / arm.sigma_posture).mean(-1), e_arm_q=e_arm_q.mean(-1),
+                p_arm_limit=((arm.limit_margin - margin).clamp(min=0) / arm.limit_margin).mean(-1).mean(-1),
+                p_arm_velocity=((self.arm_dq / hand.arm_velocity) ** 2).mean(-1).clamp(max=1).mean(-1),
+                p_arm_torque=((self.arm_tau / hand.arm_effort) ** 2).mean(-1).clamp(max=1).mean(-1),
+                p_arm_table=((arm.table_clearance - self.arm_link_z).clamp(min=0) / arm.table_clearance).amax(-1).clamp(max=1).mean(-1),
+                arm_min_z=self.arm_link_z.amin((-1, -2)))
+        return out
 
     def get_reward(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         a, m = self._args, self._metrics
         w_tac = a.w_tac if a.tactile_reward else 0.0
         terms = {"tactile": w_tac * m["r_tac"], "hand": a.w_hand * m["r_hand"], "object_position": a.w_obj * (1 - m["p_pos"]),
                  "object_axis": a.w_obj_axis * (1 - m["p_axis"]), "action_rate": -a.w_rate * self.action_rate}
+        if a.arm.enabled:
+            arm = a.arm
+            terms.update(arm_posture=arm.w_posture * m["r_arm_posture"], arm_limit=-arm.w_limit * m["p_arm_limit"],
+                         arm_velocity=-arm.w_velocity * m["p_arm_velocity"], arm_torque=-arm.w_torque * m["p_arm_torque"],
+                         arm_table=-arm.w_table * m["p_arm_table"])
         total = sum(terms.values())
         total = torch.where(self._extra_info["termination"]["error"], torch.zeros_like(total), total)
         terms["Total"] = total
@@ -519,7 +571,9 @@ class RlReconEnv(BaseEnv):
     def common_metrics(self) -> dict[str, torch.Tensor]:
         """What the runner logs and eval_rl_recon.py scores: rl_recon's terms and errors."""
         m = self._metrics
+        arm = {k: m[k] for k in ("e_arm_q", "p_arm_limit", "p_arm_velocity", "p_arm_torque", "p_arm_table", "arm_min_z") if k in m}
         return dict(
+            **arm,
             tac_tp=m["tac_tp"], tac_sim=m["tac_sim"], tac_real=m["tac_real"],
             f1_soft=m["f1_soft"], r_tac=m["r_tac"], r_hand=m["r_hand"], p_pos=m["p_pos"], p_axis=m["p_axis"],
             e_wrist=m["e_wrist_h"].mean(-1), e_rot=m["e_rot"], e_kp=m["e_kp_h"].mean(-1), e_human=m["e_human"],
@@ -558,6 +612,8 @@ class RlReconEnv(BaseEnv):
         glove = 1.0 if a.glove_obs else 0.0
         for k in a.obs_tactile_future:
             parts.append(flat(glove * self.ref_at("contact", t + k)))
+        if a.arm.enabled:
+            parts += [flat(self.arm_q), flat(self.ref_at("arm_q", t1) - self.arm_q)]
         parts += [flat(self.ref_at("ref_keypoints", t1) - self.keypoints), self.last_action]
         obs = torch.cat(parts, -1)
         return obs, obs
@@ -568,10 +624,14 @@ class RlReconEnv(BaseEnv):
         self.action_rate = ((action - self.last_action) ** 2).mean(-1).clamp(max=1.0)
         self.last_action = action.clone()
         t1 = self.t + 1
-        ref = torch.cat([self.ref_at("base_q", t1), self.ref_at("qpos", t1)], -1)           # (B, H, 26)
-        delta = (action * self.action_scale).reshape(self._num_envs, self.H, 26)
+        ref = torch.cat([self.ref_at(self.base_key, t1), self.ref_at("qpos", t1)], -1)       # (B, H, n_base + 20)
+        delta = (action * self.action_scale).reshape(self._num_envs, self.H, self.n_base + 20)
+        arm_dq = self.ref_at("arm_dq", t1) if self._args.arm.enabled else None
         for h, hand in enumerate(self.hands):
-            hand.control(ref[:, h] + delta[:, h])
+            if arm_dq is None:
+                hand.control(ref[:, h] + delta[:, h])
+            else:
+                hand.control(ref[:, h] + delta[:, h], arm_dq[:, h])
         if self.assist_scale > 0 and not self._eval_mode:
             self._assist()
         self.scene.step()
@@ -656,7 +716,7 @@ class RlReconEnv(BaseEnv):
         pose, lifted out of the table (frame 0: rl_recon's obj_rest_z) plus 2 mm."""
         n = len(envs_idx)
         for h, hand in enumerate(self.hands):
-            hand.set_state(torch.cat([self.ref_at("base_q", start)[:, h], self.ref_at("qpos", start)[:, h]], -1), envs_idx)
+            hand.set_state(torch.cat([self.ref_at(self.base_key, start)[:, h], self.ref_at("qpos", start)[:, h]], -1), envs_idx)
         in_hand = torch.zeros(n, dtype=torch.bool, device=self.device) if in_hand is None else in_hand
         # the in-hand object of each env: the hold of its start frame (rsi_hold)
         hold_obj = torch.full((n,), -1, dtype=torch.long, device=self.device)

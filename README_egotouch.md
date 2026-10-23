@@ -247,6 +247,39 @@ Syntaxe `--clé=valeur`, notation pointée pour les configs : `--env.<champ>`, `
 | `obj_rot_weight`, `obj_rot_margin` | 0.0, 0.6 | rotation complète (off) |
 | `obj_depth_discount` | 3.0 | l'erreur le long du rayon compte 1/x (terminaison) |
 
+**Bras Franka Panda (`--env.arm.*`, off par défaut)**
+
+Chaque main Wuji est montée sur un Panda posé sur la table, à la place de la base virtuelle à 6 DoF (`src/tv2s_env/sim/robots/franka_wuji.py`).
+- **Placement automatique, à la construction de l'env.** Par IK sur tout le clip, on essaie 20 positions de base, en arrière de la trajectoire du poignet du côté de la tête (là où était l'épaule du démonstrateur), et 4 orientations de la main sur la bride (0, ±90°, 180°). On garde la combinaison qui suit le mieux la trajectoire. Le résultat est affiché au lancement : `left Panda at (x, y) yaw …, IK error …`.
+- **Trajectoire articulaire de référence.** La trajectoire IK du bras sert de référence. Les 7 premières valeurs de l'action, par main, sont un résiduel sur cette trajectoire. Sa vitesse est envoyée en feedforward au PD.
+- **Observation.** Elle ajoute les articulations du bras et leur écart à la référence à t+1.
+- **Inerties.** Celles de l'URDF Genesis (`panda_bullet`) sont fictives : 0,1 kg m² partout. Elles sont remplacées par celles de MuJoCo Menagerie.
+
+| Option | Défaut | Rôle |
+|---|---|---|
+| `arm.enabled` | False | True : main sur bras Franka (action 27 par main au lieu de 26) |
+| `arm.base_xy`, `arm.base_yaw` | auto | imposer la base (m, rad) au lieu de la chercher |
+| `arm.base_distance`, `arm.base_lateral` | (0.35…0.65), (−0.2…0.2) | grille de bases candidates autour du centre de la trajectoire |
+| `arm.mount_yaw` | auto | rotation de la main sur la bride (rad) ; auto : la meilleure de 0, ±90°, 180° |
+| `arm.mount_offset` | 0.02 | distance bride → paume (m) |
+| `arm.rest_q` | pose « ready » du Panda | posture vers laquelle l'IK tire dans l'espace nul |
+| `arm.kp`, `arm.kv`, `arm.effort` | gains Genesis, couples max du Panda (87 / 12 N m) | PD et limites |
+| `arm.action_scale` | 0.05 ×4, 0.1 ×3 | amplitude du résiduel articulaire (rad) |
+
+Termes de récompense ajoutés quand le bras est activé :
+
+| Terme | Option (poids, échelle) | Rôle |
+|---|---|---|
+| `arm_posture` | `arm.w_posture` 0.3, `arm.sigma_posture` 0.3 | + exp(−‖q − q_ref‖ / σ) : rester près de la posture IK (coude) |
+| `arm_limit` | `arm.w_limit` 0.5, `arm.limit_margin` 0.15 | − profondeur dans les derniers 0.15 rad des butées |
+| `arm_velocity` | `arm.w_velocity` 0.05 | − (dq / vitesse max du Panda)² |
+| `arm_torque` | `arm.w_torque` 0.05 | − (couple / couple max)² |
+| `arm_table` | `arm.w_table` 1.0, `arm.table_clearance` 0.08 | − segments 3 à 7 du bras plus bas que 8 cm au-dessus de la table |
+
+Les métriques correspondantes sont loggées : `e_arm_q`, `p_arm_limit`, `p_arm_velocity`, `p_arm_torque`, `p_arm_table`, `arm_min_z`.
+
+Limite connue : les articulations 5 à 7 du Panda sont plafonnées à 2,6 rad/s et 12 N m. Une rotation rapide du poignet humain (jusqu'à 7 rad/s sur le tournevis, frames 160–190) ne peut pas être suivie à la même vitesse.
+
 **Assistance objet (`--env.*`, entraînement seulement)**
 
 | Option | Défaut | Rôle |
@@ -311,6 +344,7 @@ Syntaxe `--clé=valeur`, notation pointée pour les configs : `--env.<champ>`, `
 | Randomisation des gains | `--env.hands.kp_range=0.8,1.2 --env.hands.kd_range=0.8,1.2` |
 | Vidéos plus fréquentes / off | `--runner.video_interval=250` / `=0` |
 | Lightning | `--lightning=True` |
+| Main sur bras Franka Panda | `--env.arm.enabled=True` |
 | Fine-tune | `RESUME=logs/et_hammer/<time>/checkpoints/checkpoint_01000.pt FINETUNE=1` |
 
 ## 6. Évaluation

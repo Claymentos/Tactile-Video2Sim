@@ -19,6 +19,7 @@ from tv2s_env.sim.envs.config.schema import HandArgs
 
 
 class FloatingWujiHand:
+    n_base = 6
     def __init__(self, scene: gs.Scene, side: str, base_rotation: np.ndarray, args: HandArgs, work_dir: str,
                  device: torch.device):
         self.side = side
