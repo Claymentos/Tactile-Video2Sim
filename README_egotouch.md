@@ -179,6 +179,119 @@ TV2S_WANDB=1 RECON_ARGS="OBJECT=hammer FRAME=0" PREP_ARGS="--side left" \
 
 Sortie : `logs/<name>/<time>/` avec `checkpoints/`, `configs/`, `progress.csv`, `tb/`, `videos/` et `eval_rl_recon/`.
 
+### Recette complète : `et_hammer_da3_contact_arm` (marteau, main Wuji sur bras Franka)
+
+Toutes les commandes du run `logs/et_hammer_da3_contact_arm/20261026_103141` (26/10/2026), du téléchargement à l'évaluation. Toutes les options sont écrites, y compris celles laissées à leur valeur par défaut.
+
+- **Code.** Le commit `2356d74` ou suivant. Le run a été lancé sur `5703f82`, plus le placement du bras noté sur la manipulation et le terme `power`, commités ensuite dans `2356d74`.
+- **Environnements Python** (`launch/config.sh`) :
+  - `genesis` (`PY_SIM`) : téléchargement, reconstruction, référence, PPO ;
+  - `lerobot` (`PY_QWEN`) : Qwen-VL ;
+  - `~/venvs/da3` (`PY_DA3`) : Depth-Anything-3.
+- **Machine du run.** RTX 3080 Laptop (16 Go) : 76 min pour 2000 itérations (environ 34 k fps), sans compter l'évaluation.
+
+**0. Variables (même terminal pour toute la suite)**
+```bash
+cd ~/Tactile-Video2Sim
+TASK=pick_up_hammer
+STAMP=20260321_095958_211
+KEY=${TASK}__${STAMP}
+NAME=et_hammer_da3_contact          # la référence
+RUN=${NAME}_arm                     # le dossier de logs
+mkdir -p logs/pipeline
+```
+
+**1. Téléchargement de l'épisode**
+```bash
+python scripts/data/download_egotouch.py --root ~/EgoTouch --tasks $TASK --episodes $STAMP
+```
+L'épisode arrive dans `~/EgoTouch/Workbench/pick_up_hammer/20260321_095958_211/`.
+
+**2. Extraction et scène avec Qwen-VL en local**
+```bash
+VLM=qwen MODEL=Qwen/Qwen3-VL-4B-Instruct GEMINI_FPS=4 OUT=data/egotouch \
+    launch/prepare_egotouch.sh $KEY
+cat data/egotouch/scene/$KEY.json
+```
+Résultat obtenu : `hands_used: left` et l'objet `hammer`.
+
+**3. Reconstruction : profondeur DA3 et correction par le contact**
+```bash
+DEPTH=da3 DA3_CHECKPOINT=depth-anything/DA3METRIC-LARGE HAND_CONTACT=1 \
+HANDS=mocap HAND_SIDES="left right" HAND_PLACEMENT=smooth HAND_POSE_SMOOTH=4 HAND_DEPTH=moge HAND_KNOT_FRAMES=10 \
+    launch/reconstruct.sh $KEY data/egotouch/recon/$KEY > logs/pipeline/${NAME}_recon.log 2>&1
+```
+- **Options.** L'objet (`OBJECT`) et la frame de référence (`FRAME`) viennent du fichier de scène. DA3 tourne avec `--process-res 504`.
+- **Résultat.**
+  - `video.json` indique `"depth": "da3"`.
+  - Dans `hand_contact.json`, la saisie est à la frame 37 : λ appliqué de 1,04, écart main–objet de 13,0 cm avant correction et 9,1 cm après.
+  - La prise est tenue des frames 43 à 325.
+
+**4. Référence RL**
+```bash
+python scripts/rl/prepare_reference.py --recon data/egotouch/recon/$KEY --scene data/egotouch/scene/$KEY.json \
+    --out data/references/$NAME --clearance-mode frame --hand-table-clearance 0.008 \
+    --object-trajectory keyframes --anchor vision --object-target dense
+```
+- La main (`left`) vient de `hands_used` ; l'objet (`hammer`) est celui qui a une trajectoire et un mesh.
+- Résultat : 397 frames à 30 Hz (13,2 s), une prise.
+- Ici la main ne passe jamais sous la table (`hand_dz = 0`), donc `--clearance-mode frame` ou `global` donnent la même référence.
+
+**5. Vérification de la référence**
+```bash
+python scripts/reconstruction/replay_raw_genesis.py --reference data/references/$NAME/reference.npz --human
+```
+
+**6. Test court du placement du bras (optionnel)**
+```bash
+REFERENCE=data/references/$NAME/reference.npz SKIP_SCENE=1 SKIP_RECON=1 SKIP_REFERENCE=1 SKIP_EVAL=1 \
+    N_ENVS=256 ITERATIONS=30 TRAIN_ARGS="--env.arm.enabled=True --runner.video_interval=0" \
+    launch/rl_recon.sh ${NAME}_armtest $KEY 2>&1 | tee logs/pipeline/${NAME}_armtest.log
+rm -r logs/${NAME}_armtest
+```
+Placement attendu :
+```
+left Panda at (0.27, -0.56) yaw 144 deg, hand turned -120 deg (240 candidates): IK error to frame 354 0.13 cm / 0.5 deg mean
+```
+
+**7. Entraînement PPO et évaluation**
+```bash
+TV2S_WANDB=1 REFERENCE=data/references/$NAME/reference.npz SKIP_SCENE=1 SKIP_RECON=1 SKIP_REFERENCE=1 \
+    N_ENVS=2048 ITERATIONS=2000 TRAIN_ARGS="--env.arm.enabled=True" \
+    launch/rl_recon.sh $RUN $KEY > logs/pipeline/${RUN}_train.log 2>&1
+```
+Cette commande lance successivement :
+```bash
+python scripts/policy/run_ppo_recon.py --exp_name=$RUN --env.data.reference=data/references/$NAME/reference.npz \
+    --num_envs=2048 --runner.total_iterations=2000 --env.arm.enabled=True
+python scripts/policy/eval_rl_recon.py --exp_name $RUN --all
+```
+
+Configuration effective du run, d'après `configs/*.json`. Seuls `data.reference` et `arm.enabled` diffèrent des valeurs par défaut.
+
+| Bloc | Valeurs |
+|---|---|
+| PPO (`--algo.*`) | MLP 512-256-128 ELU (acteur et critique), `lr` 5e-4 adaptatif (`target_kl` 0.01, bornes 1e-5 à 5e-3), `gamma` 0.99, `gae_lambda` 0.95, `clip_ratio` 0.2, `value_clip` True, `value_loss_coef` 1.0, `entropy_coef` 0, `max_grad_norm` 1.0, 5 epochs × 4 mini-batches, `rollout_length` 32, `initial_log_std` ln 0.4, `obs_normalization` True |
+| Runner (`--runner.*`) | `total_iterations` 2000, `log_interval` 10, `save_interval` 25, `video_interval` 500 |
+| Env (`--env.*`) | `seed` 3, `substeps` 4, `train_start` first, `eval_start` first, `active_hands` reference, `action_scale_finger` 0.4, `w_tac` 1.5, `w_hand` 1.0, `w_obj` 0.5, `w_obj_axis` 0.75, `w_rate` 0.02, `term_wrist` 0.10, `term_kp` 0.06, `term_obj` 0.20, `assist_init` 1.0, `assist_decay` 0.5, `obs_future` (1,2,4), `obs_tactile_future` (1,5) |
+| Bras (`--env.arm.*`) | `enabled` True, placement auto (`base_distance` 0.35…0.65, `base_lateral` −0.2…0.2, `mount_yaw` auto par pas de 30°), `mount_offset` 0.02, `rest_q` (0, −0.3, 0, −2.2, 0, 2.0, 0.785), `kp` (4500, 4500, 3500, 3500, 2000, 2000, 2000), `kv` (450, 450, 350, 350, 200, 200, 200), `effort` (87 ×4, 12 ×3), `action_scale` (0.05 ×4, 0.1 ×3) |
+| Récompenses du bras | `w_posture` 0.3 (`sigma_posture` 0.3), `w_limit` 0.5 (`limit_margin` 0.15), `w_velocity` 0.05, `w_torque` 0.05, `w_table` 1.0 (`table_clearance` 0.08), `w_power` 0.4 (`k_power` 0.01) |
+
+**Résultats obtenus**
+
+| | |
+|---|---|
+| Entraînement, itération 2000 | longueur moyenne 194 frames, tac F1 0.49, puissance ~67 W |
+| Évaluation depuis la frame 0, meilleur checkpoint (1875) | tac F1 0.40, poignet 1.6 cm, objet 12.6 cm (3D), hauteur max de l'objet 56 cm, premier échec à la frame 194 |
+| Évaluation en main (frame 131) | tac F1 ≈ 0, objet ~16 cm : la prise depuis la main n'est pas apprise |
+
+Le premier échec, à la frame 194, correspond au geste rapide des frames 189–207. Il demande jusqu'à ~3 fois la vitesse max des articulations du Panda (§ « Bras Franka Panda », limite connue).
+
+**8. Vidéo de la policy**
+```bash
+python scripts/policy/visualize_episode.py --exp $RUN --checkpoint best
+```
+
 ### Variables de `launch/rl_recon.sh NAME KEY`
 
 | Variable | Rôle |
