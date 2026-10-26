@@ -45,8 +45,8 @@ Franka arm (`arm.enabled`, franka_wuji.py): each hand on a Panda standing on the
   reference: the action's first 7 values per hand are a residual on it (arm.action_scale rad), the observation
   adds the arm joints and their error to the reference at t+1, and the reward adds
                  w_posture exp(-|q - q_ref| / sigma_posture) - w_limit p_limit - w_velocity p_velocity
-                 - w_torque p_torque - w_table p_table
-               p_limit the joints' depth into their last limit_margin rad, p_velocity (dq / Panda velocity limit)^2,
+                 - w_torque p_torque - w_table p_table + w_power exp(-k_power P)
+               P = sum |torque dq| over the arm and finger joints (W; DexTaG's AllDOFPowerPenalty), p_limit the joints' depth into their last limit_margin rad, p_velocity (dq / Panda velocity limit)^2,
                p_torque (torque / effort)^2 (joint means, hands averaged), p_table the lowest of links 3-7 below
                table_clearance (fraction of it).
 
@@ -233,13 +233,17 @@ class RlReconEnv(BaseEnv):
         self.arm_placement = []
         if a.arm.enabled:
             for h, s in enumerate(self.sides):
-                pl = place_arm(a.arm, ref["wrist_pos"][:, h], ref["wrist_rot"][:, h], ref["head_pos"], ref["obj_pos"][0])
+                # placed for the manipulation: up to 1 s after the hand's last glove contact
+                touch = np.flatnonzero(n_contact[:, h] >= 5)
+                end = min(T, int(touch[-1]) + int(self.hz)) if len(touch) else T
+                pl = place_arm(a.arm, ref["wrist_pos"][:, h], ref["wrist_rot"][:, h], ref["head_pos"], ref["obj_pos"][0], end)
                 self.arm_placement.append(pl)
-                B = pl["base"]
+                B, ep, er = pl["base"], pl["e_pos"], pl["e_rot"]
                 print(f"  {s} Panda at ({B[0, 3]:.2f}, {B[1, 3]:.2f}) yaw {np.degrees(np.arctan2(B[1, 0], B[0, 0])):.0f} deg, hand "
-                      f"turned {np.degrees(pl['mount_yaw']):.0f} deg ({pl['candidates']} candidates): IK error "
-                      f"{pl['e_pos'].mean() * 100:.2f} cm / {np.degrees(pl['e_rot'].mean()):.1f} deg mean, "
-                      f"{pl['e_pos'].max() * 100:.2f} cm / {np.degrees(pl['e_rot'].max()):.1f} deg max")
+                      f"turned {np.degrees(pl['mount_yaw']):.0f} deg ({pl['candidates']} candidates): IK error to frame {end} "
+                      f"{ep[:end].mean() * 100:.2f} cm / {np.degrees(er[:end].mean()):.1f} deg mean, "
+                      f"{ep[:end].max() * 100:.2f} cm / {np.degrees(er[:end].max()):.1f} deg max; after it "
+                      f"{ep[end:].max(initial=0) * 100:.2f} cm / {np.degrees(er[end:].max(initial=0)):.1f} deg max")
             ref["arm_q"] = np.stack([pl["q"] for pl in self.arm_placement], 1)                  # (T, H, 7)
             ref["arm_dq"] = np.gradient(ref["arm_q"], axis=0) * self.hz                         # fed forward
 
@@ -437,6 +441,7 @@ class RlReconEnv(BaseEnv):
         if self._args.arm.enabled:
             self.arm_q, self.arm_dq, self.arm_tau = q[..., :nb], dq[..., :nb], stack("force")[..., :nb]
             self.arm_link_z = stack("arm_link_z")                                          # (B, H, links)
+            self.dof_power = (stack("force") * dq).abs().sum(-1)                           # (B, H) W, arm + fingers
         self.base_pos, self.base_rot, self.base_quat = stack("palm_pos"), stack("palm_rot"), stack("palm_quat")
         self.keypoints, self.finger_link_pos = stack("keypoints"), stack("tip_pos")
         E = self.scene_entities
@@ -550,7 +555,8 @@ class RlReconEnv(BaseEnv):
                 p_arm_velocity=((self.arm_dq / hand.arm_velocity) ** 2).mean(-1).clamp(max=1).mean(-1),
                 p_arm_torque=((self.arm_tau / hand.arm_effort) ** 2).mean(-1).clamp(max=1).mean(-1),
                 p_arm_table=((arm.table_clearance - self.arm_link_z).clamp(min=0) / arm.table_clearance).amax(-1).clamp(max=1).mean(-1),
-                arm_min_z=self.arm_link_z.amin((-1, -2)))
+                arm_min_z=self.arm_link_z.amin((-1, -2)),
+                r_power=torch.exp(-arm.k_power * self.dof_power).mean(-1), power=self.dof_power.mean(-1))
         return out
 
     def get_reward(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -562,7 +568,7 @@ class RlReconEnv(BaseEnv):
             arm = a.arm
             terms.update(arm_posture=arm.w_posture * m["r_arm_posture"], arm_limit=-arm.w_limit * m["p_arm_limit"],
                          arm_velocity=-arm.w_velocity * m["p_arm_velocity"], arm_torque=-arm.w_torque * m["p_arm_torque"],
-                         arm_table=-arm.w_table * m["p_arm_table"])
+                         arm_table=-arm.w_table * m["p_arm_table"], power=arm.w_power * m["r_power"])
         total = sum(terms.values())
         total = torch.where(self._extra_info["termination"]["error"], torch.zeros_like(total), total)
         terms["Total"] = total
@@ -571,7 +577,7 @@ class RlReconEnv(BaseEnv):
     def common_metrics(self) -> dict[str, torch.Tensor]:
         """What the runner logs and eval_rl_recon.py scores: rl_recon's terms and errors."""
         m = self._metrics
-        arm = {k: m[k] for k in ("e_arm_q", "p_arm_limit", "p_arm_velocity", "p_arm_torque", "p_arm_table", "arm_min_z") if k in m}
+        arm = {k: m[k] for k in ("e_arm_q", "p_arm_limit", "p_arm_velocity", "p_arm_torque", "p_arm_table", "arm_min_z", "power") if k in m}
         return dict(
             **arm,
             tac_tp=m["tac_tp"], tac_sim=m["tac_sim"], tac_real=m["tac_real"],

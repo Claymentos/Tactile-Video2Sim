@@ -260,7 +260,7 @@ Chaque main Wuji est montée sur un Panda posé sur la table, à la place de la 
 | `arm.enabled` | False | True : main sur bras Franka (action 27 par main au lieu de 26) |
 | `arm.base_xy`, `arm.base_yaw` | auto | imposer la base (m, rad) au lieu de la chercher |
 | `arm.base_distance`, `arm.base_lateral` | (0.35…0.65), (−0.2…0.2) | grille de bases candidates autour du centre de la trajectoire |
-| `arm.mount_yaw` | auto | rotation de la main sur la bride (rad) ; auto : la meilleure de 0, ±90°, 180° |
+| `arm.mount_yaw` | auto | rotation de la main sur la bride (rad) ; auto : le meilleur multiple de 30°, noté par IK sur la manipulation (jusqu'à 1 s après le dernier contact du gant) |
 | `arm.mount_offset` | 0.02 | distance bride → paume (m) |
 | `arm.rest_q` | pose « ready » du Panda | posture vers laquelle l'IK tire dans l'espace nul |
 | `arm.kp`, `arm.kv`, `arm.effort` | gains Genesis, couples max du Panda (87 / 12 N m) | PD et limites |
@@ -275,8 +275,9 @@ Termes de récompense ajoutés quand le bras est activé :
 | `arm_velocity` | `arm.w_velocity` 0.05 | − (dq / vitesse max du Panda)² |
 | `arm_torque` | `arm.w_torque` 0.05 | − (couple / couple max)² |
 | `arm_table` | `arm.w_table` 1.0, `arm.table_clearance` 0.08 | − segments 3 à 7 du bras plus bas que 8 cm au-dessus de la table |
+| `power` | `arm.w_power` 0.4, `arm.k_power` 0.01 | + exp(−k Σ\|couple × vitesse\|) sur le bras et les doigts (W) : `AllDOFPowerPenalty` de DexTaG, k recalibré pour le Panda (~50 W en suivi, 300–550 W dans un geste rapide) |
 
-Les métriques correspondantes sont loggées : `e_arm_q`, `p_arm_limit`, `p_arm_velocity`, `p_arm_torque`, `p_arm_table`, `arm_min_z`.
+Les métriques correspondantes sont loggées : `e_arm_q`, `p_arm_limit`, `p_arm_velocity`, `p_arm_torque`, `p_arm_table`, `arm_min_z`, `power` (W).
 
 Limite connue : les articulations 5 à 7 du Panda sont plafonnées à 2,6 rad/s et 12 N m. Une rotation rapide du poignet humain (jusqu'à 7 rad/s sur le tournevis, frames 160–190) ne peut pas être suivie à la même vitesse.
 

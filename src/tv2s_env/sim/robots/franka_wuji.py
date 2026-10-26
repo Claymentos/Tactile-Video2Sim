@@ -116,12 +116,14 @@ class PandaKinematics:
 
 
 def place_arm(arm: ArmArgs, wrist_pos: np.ndarray, wrist_rot: np.ndarray, head_pos: np.ndarray,
-              obstacles: np.ndarray) -> dict:
+              obstacles: np.ndarray, score_end: int | None = None) -> dict:
     """The base (4, 4), the mount (4, 4) and the joint reference (T, 7) of one hand's arm. Candidate bases (unless
     arm.base_xy): around the wrist trajectory's centre, base_distance towards the head and base_lateral across,
     facing the centre, at least 15 cm from the objects; candidate mounts (unless arm.mount_yaw): the hand turned by
-    0, +-90 or 180 deg on the flange (on pick_up_screwdriver/103227: 5.5 cm / 42 deg worst errors at 0 deg, 1 mm at
-    180). Scored on every third frame by position error + rotation error / 50 + limit proximity."""
+    a multiple of 30 deg on the flange (on pick_up_screwdriver/103227: 5.5 cm / 42 deg worst errors at 0 deg, 1 mm at
+    180). Scored on every third frame before `score_end` (the manipulation: on pick_up_hammer/095941 the wrist rolls
+    380 deg after the release, and placing for it pinned joint 7 from frame 36 on and flipped the arm at the grasp)
+    by position error + rotation error / 50 + limit proximity."""
     rest = np.asarray(arm.rest_q, float)
     centre = wrist_pos[:, :2].mean(0)
     if arm.base_xy is not None:
@@ -138,13 +140,13 @@ def place_arm(arm: ArmArgs, wrist_pos: np.ndarray, wrist_rot: np.ndarray, head_p
         if arm.base_yaw is not None:
             yaw[:] = arm.base_yaw
     bases = np.stack([base_transform(p, y) for p, y in zip(xy, yaw)])
-    mounts = [arm.mount_yaw] if arm.mount_yaw is not None else [0.0, np.pi / 2, -np.pi / 2, np.pi]
+    mounts = [arm.mount_yaw] if arm.mount_yaw is not None else np.radians(np.arange(-180, 180, 30))
     best = (np.inf, 0, mounts[0])
     for m in mounts:
         kin = PandaKinematics(arm.urdf or default_panda_urdf(), mount_transform(arm, m))
         if len(bases) * len(mounts) == 1:
             break
-        q, ep, er = kin.track(bases, wrist_pos, wrist_rot, rest, np.arange(0, len(wrist_pos), 3))
+        q, ep, er = kin.track(bases, wrist_pos, wrist_rot, rest, np.arange(0, score_end or len(wrist_pos), 3))
         margin = np.minimum(q - kin.lower, kin.upper - q)
         cost = ep.mean(-1) + er.mean(-1) / 50 + 0.05 * (np.clip(arm.limit_margin - margin, 0, None) / arm.limit_margin).mean((-1, -2))
         k = int(np.argmin(cost))

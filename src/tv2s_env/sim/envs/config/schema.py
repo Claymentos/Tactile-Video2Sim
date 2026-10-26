@@ -37,7 +37,7 @@ class ArmArgs(BaseModel):
     urdf: str | None = None                  # Panda without gripper; None: Genesis' urdf/panda_bullet/panda_nohand.urdf
     # mount: the palm frame on the flange (z along the forearm, as the palm's fingers), `mount_offset` m out of it
     mount_offset: float = 0.02
-    mount_yaw: float | None = None           # rad about the flange axis; None: the best of 0, +-90, 180 deg by IK
+    mount_yaw: float | None = None           # rad about the flange axis; None: the best multiple of 30 deg by IK
     # base on the table (z = 0): None places it by IK over the clip (candidates behind the wrist trajectory, on
     # the side of the head, `base_distance` m from its centre), else this (x, y) and yaw
     base_xy: tuple[float, float] | None = None
@@ -60,6 +60,11 @@ class ArmArgs(BaseModel):
     w_torque: float = 0.05                   # (torque / effort)^2
     w_table: float = 1.0                     # arm links below table_clearance (m) above the table
     table_clearance: float = 0.08            # link frames sit on the joint axes, ~6 cm inside the links' surface
+    # DexTaG's AllDOFPowerPenalty: + w_power exp(-k_power sum |torque dq|) over the arm and finger joints. DexTaG's
+    # k = 10 /W would read 0 here: the Panda tracking the reference spends ~50 W (median on pick_up_hammer/095941,
+    # 300-550 W in its fast swing), the fingers ~0.2 W; w_power ~10% of the positive terms, as DexTaG's 50 / ~485
+    w_power: float = 0.4
+    k_power: float = 0.01                    # 1/W
 
 
 class TactileArgs(BaseModel):
