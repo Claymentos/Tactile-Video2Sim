@@ -1,0 +1,8 @@
+{
+ "recon": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/recon/pick_up_hammer__20260321_095958_211",
+ "episode": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/recon/pick_up_hammer__20260321_095958_211/source",
+ "scene": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/scene/pick_up_hammer__20260321_095958_211.json",
+ "sides": [
+  "left"
+ ]
+}

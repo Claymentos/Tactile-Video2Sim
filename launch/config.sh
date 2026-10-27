@@ -17,7 +17,15 @@ if [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH/venvs/genesis" ]; then
     CONDA_BASE="${CONDA_BASE:-$SCRATCH/conda}"
     PY_SIM="${PY_SIM:-$SCRATCH/venvs/genesis/bin/python}"
     PY_DATA="${PY_DATA:-$PY_SIM}"
+    [ ! -d "$EGOTOUCH_ROOT" ] && [ -d "$SCRATCH/egotouch/data" ] && EGOTOUCH_ROOT="$SCRATCH/egotouch/data"
+    [ -x "$SCRATCH/venvs/qwen/bin/python" ] && PY_QWEN="${PY_QWEN:-$SCRATCH/venvs/qwen/bin/python}"
+    [ -x "$SCRATCH/venvs/da3/bin/python" ] && PY_DA3="${PY_DA3:-$SCRATCH/venvs/da3/bin/python}"
+    [ -d "$WORK/ext/recgen" ] && export RECGEN_DIR="${RECGEN_DIR:-$WORK/ext/recgen}"
+    [ -d "$WORK/ext/MoGe" ] && MOGE_REPO="${MOGE_REPO:-$WORK/ext/MoGe}"
 fi
+# Genesis 1.3.3 times its two constraint solvers on 2 calls and, on an H100, keeps the decomposed (CUDA graph) one,
+# 13x slower here than the monolith (rl_recon, 2048 envs: 4.4k vs 60k env steps/s, the same physics)
+export QD_PERFDISPATCH_FORCE="${QD_PERFDISPATCH_FORCE:-func_solve_body:func_solve_body_monolith}"
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
 PY_DATA="${PY_DATA:-$CONDA_BASE/envs/lerobot/bin/python}"              # pandas + pyarrow (parquet)
 PY_RETARGET="${PY_RETARGET:-$CONDA_BASE/envs/wuji_retargeting/bin/python}"   # pinocchio + wuji_retargeting

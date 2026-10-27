@@ -1,0 +1,7 @@
+{
+  "recon_dir": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/recon/pick_up_screwdriver__20260321_103227_213_da3",
+  "episode": "/home/cl-ment-prigent/EgoTouch/Workbench/pick_up_screwdriver/20260321_103227_213",
+  "object": "screwdriver",
+  "side": "left",
+  "frames": 223
+}

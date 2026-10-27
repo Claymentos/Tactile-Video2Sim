@@ -492,7 +492,7 @@ def main():
             keypoint_ok[t, 21 * k : 21 * k + 21] = inside
             # The glove surface under the knuckles; the joint centres sit ~1 cm deeper,
             # which the median over the whole hand absorbs as a constant bias.
-            px = np.round(uv[inside]).astype(int)
+            px = np.minimum(np.round(uv[inside]).astype(int), [width - 1, height - 1])   # u < width rounds up to width
             samples = depth[px[:, 1], px[:, 0]]
             samples = samples[samples > 0]
             if len(samples) >= 8:

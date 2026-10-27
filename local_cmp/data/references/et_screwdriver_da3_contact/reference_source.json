@@ -1,0 +1,8 @@
+{
+ "recon": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/recon/pick_up_screwdriver__20260321_103227_213_da3",
+ "episode": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/recon/pick_up_screwdriver__20260321_103227_213_da3/source",
+ "scene": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/scene/pick_up_screwdriver__20260321_103227_213.json",
+ "sides": [
+  "left"
+ ]
+}

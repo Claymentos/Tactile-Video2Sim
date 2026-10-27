@@ -1,0 +1,131 @@
+{
+  "video": "/home/cl-ment-prigent/EgoTouch/Workbench/pick_up_screwdriver/20260321_103227_213/chest.mp4",
+  "duration_s": 7.43,
+  "model": "Qwen/Qwen3-VL-4B-Instruct",
+  "sampled_fps": 4.0,
+  "context": "Task: pick up screwdriver (scene category: Workbench). Head-mounted camera looking down at the hands.",
+  "scene": "a person wearing tactile gloves is picking up a screwdriver from a wooden table",
+  "hands_used": "left",
+  "hands_reason": "The left hand is the one that picks up the screwdriver, while the right hand remains idle.",
+  "hands_in_clips": "left",
+  "objects": [
+    {
+      "id": "screwdriver",
+      "description": "a yellow-handled screwdriver with a metal tip, lying on a wooden table",
+      "visible_at_s": 0.0,
+      "material": "plastic",
+      "shape": "irregular",
+      "size_cm": [
+        15,
+        10,
+        5
+      ],
+      "is_container": false,
+      "mass_g": 100,
+      "is_static": false,
+      "initial_location": "on the table, center"
+    },
+    {
+      "id": "table",
+      "description": "a wooden table with a smooth surface, positioned in the center of the frame",
+      "visible_at_s": 0.0,
+      "material": "wood",
+      "shape": "flat",
+      "size_cm": [
+        120,
+        80,
+        30
+      ],
+      "is_container": false,
+      "mass_g": 1000,
+      "is_static": true,
+      "initial_location": "on the floor, center"
+    }
+  ],
+  "clips": [
+    {
+      "start_s": 0.0,
+      "end_s": 0.7,
+      "caption": "The left hand reaches for the screwdriver on the table and picks it up.",
+      "left_hand": {
+        "action": "grasp_and_move",
+        "object": "screwdriver",
+        "from": "table",
+        "to": "none"
+      },
+      "right_hand": {
+        "action": "none",
+        "object": "none",
+        "from": "none",
+        "to": "none"
+      },
+      "objects_present": [
+        "screwdriver",
+        "table"
+      ],
+      "objects_manipulated": [
+        "screwdriver"
+      ],
+      "objects_used": [
+        "screwdriver",
+        "table"
+      ]
+    },
+    {
+      "start_s": 0.7,
+      "end_s": 1.2,
+      "caption": "The left hand holds the screwdriver and moves it slightly, while the right hand remains stationary.",
+      "left_hand": {
+        "action": "hold_static",
+        "object": "screwdriver",
+        "from": "table",
+        "to": "none"
+      },
+      "right_hand": {
+        "action": "none",
+        "object": "none",
+        "from": "none",
+        "to": "none"
+      },
+      "objects_present": [
+        "screwdriver",
+        "table"
+      ],
+      "objects_manipulated": [
+        "screwdriver"
+      ],
+      "objects_used": [
+        "screwdriver",
+        "table"
+      ]
+    },
+    {
+      "start_s": 1.2,
+      "end_s": 2.0,
+      "caption": "The left hand places the screwdriver back on the table, then moves away.",
+      "left_hand": {
+        "action": "push_or_touch",
+        "object": "screwdriver",
+        "from": "none",
+        "to": "table"
+      },
+      "right_hand": {
+        "action": "none",
+        "object": "none",
+        "from": "none",
+        "to": "none"
+      },
+      "objects_present": [
+        "screwdriver",
+        "table"
+      ],
+      "objects_manipulated": [
+        "screwdriver"
+      ],
+      "objects_used": [
+        "screwdriver",
+        "table"
+      ]
+    }
+  ]
+}

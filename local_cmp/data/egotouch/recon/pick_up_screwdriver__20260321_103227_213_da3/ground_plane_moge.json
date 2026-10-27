@@ -1,0 +1,10 @@
+{
+  "normal_camera": [
+    -0.10184043795842879,
+    -0.044849229947515105,
+    -0.9937892491718506
+  ],
+  "offset": 1.1904748272624661,
+  "inlier_fraction": 0.20372899673648961,
+  "depth": "/home/cl-ment-prigent/Tactile-Video2Sim/data/egotouch/recon/pick_up_screwdriver__20260321_103227_213_da3/depth_moge/000000.png"
+}

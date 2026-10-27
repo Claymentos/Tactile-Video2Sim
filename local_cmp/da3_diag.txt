@@ -1,0 +1,20 @@
+2356d74
+3d835ec
+depth-anything-3                     0.0.0        /home/cl-ment-prigent/Depth-Anything-3
+numpy                                1.26.4
+opencv-python-headless               5.0.0.93
+torch                                2.14.0
+torchvision                          0.29.0
+/home/cl-ment-prigent/Depth-Anything-3/src/depth_anything_3/cfg.py:25: UserWarning: register_new_resolver() is deprecated and will be removed in a future release.
+Use register_resolver() instead.
+See https://github.com/hydra-ecosystem/omegaconf/issues/426 for migration instructions.
+
+  OmegaConf.register_new_resolver("eval", eval)
+[93m[WARN ] Dependency `gsplat` is required for rendering 3DGS. Install via: pip install git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70[0m
+2.14.0+cu130 NVIDIA GeForce RTX 3080 Laptop GPU
+[97m[INFO ] using MLP layer as FFN[0m
+[97m[INFO ] Processed Images Done taking 0.0156252384185791 seconds. Shape:  torch.Size([1, 3, 378, 504])[0m
+[97m[INFO ] Model Forward Pass Done. Time: 0.3014988899230957 seconds[0m
+[97m[INFO ] Conversion to Prediction Done. Time: 0.0010266304016113281 seconds[0m
+focal 514.6585693359375 width 640 out (378, 504) -> m 0.9918210506439209
+stored median m 1.22

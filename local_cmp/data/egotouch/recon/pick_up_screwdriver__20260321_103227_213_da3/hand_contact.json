@@ -1,0 +1,30 @@
+{
+ "object": "screwdriver",
+ "sides": {
+  "left": {
+   "holds": [
+    [
+     47,
+     174
+    ]
+   ],
+   "anchors": [
+    {
+     "kind": "grasp",
+     "frame": 41,
+     "lam": 1.0726950049400328,
+     "gap_cm": 6.4,
+     "shift_cm": 7.4,
+     "lam_applied": 1.0707898753937037,
+     "gap_after_cm": 1.0
+    }
+   ],
+   "notes": [
+    "release at 176: the tracked object is still 6.9 cm from its rest pose (carried, or tracked on the glove): not used"
+   ],
+   "lam_min": 1.038845022834142,
+   "lam_max": 1.0726950049400328,
+   "frames_held_by_table": 48
+  }
+ }
+}
