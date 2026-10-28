@@ -129,7 +129,8 @@ def main() -> None:
         c = env.base_pos[0].mean(0).cpu().numpy()
         env.camera.set_pose(pos=c + np.array([0.0, -0.55, 0.45]), lookat=c, up=(0, 0, 1))
         side = np.asarray(env.camera.render(rgb=True, force_render=True)[0])
-        img = cv2.imread(str(frames_dir / f"{tt:06d}.png"))
+        real_t = int(round(float(ref["source_frame"][tt]))) if "source_frame" in ref.files else tt   # retime_reference.py
+        img = cv2.imread(str(frames_dir / f"{real_t:06d}.png"))
         real = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA) if img is not None else np.zeros((h, w, 3), np.uint8)
         row = np.hstack([real, cv2.cvtColor(ego, cv2.COLOR_RGB2BGR), cv2.cvtColor(side, cv2.COLOR_RGB2BGR)])
         band = np.full((34, 3 * w, 3), 25, np.uint8)

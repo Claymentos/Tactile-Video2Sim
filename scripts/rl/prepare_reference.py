@@ -114,13 +114,16 @@ def select_grasp_pose(reference: Path, frames: int = 40, max_slip: float = 0.02,
         print(f"{k:2d} {ref['grasp_candidates_loss'][k]:.5f}  {ref['grasp_candidates_f1'][k]:5.2f}    {f1_sim[k]:5.2f}"
               f"    {ref['grasp_candidates_axis_deg'][k]:6.0f}     {ref['grasp_candidates_across'][k] * 100:6.1f}"
               f"     {slip[k] * 100:6.1f}   {'yes' if held[k] else ''}")
+    # the slips kept either way: check_reference.py's quality gate (the median slip predicts the RL's outcome
+    # better than held / not held: the hammer 095958 slips 3 cm, none held, and its policy reaches F1 0.6)
+    ref.update(grasp_candidates_slip=slip, grasp_candidates_f1_sim=f1_sim)
     if not held.any():
         print("no candidate is held by the uncorrected hand: keeping the optimiser's best pose")
-        return
-    best = int(np.flatnonzero(held)[0])                       # candidates are sorted by loss
-    print(f"-> candidate {best}")
-    ref.update(grasp_R_palm=Rc[best], grasp_p_palm=pc[best], grasp_f1=float(ref["grasp_candidates_f1"][best]),
-               grasp_selected=best)
+    else:
+        best = int(np.flatnonzero(held)[0])                   # candidates are sorted by loss
+        print(f"-> candidate {best}")
+        ref.update(grasp_R_palm=Rc[best], grasp_p_palm=pc[best], grasp_f1=float(ref["grasp_candidates_f1"][best]),
+                   grasp_selected=best)
     np.savez(reference, **ref)
 
 

@@ -146,6 +146,23 @@ def small_video(src: Path, dst: Path, height: int) -> float:
     return duration
 
 
+def fill_none(x, schema: dict):
+    """`x` with the required fields it misses filled with "none" where the schema allows it (Qwen leaves out an idle
+    hand's from / to: pick_up_screwdriver/103300, pick_up_protein_powder_container/095659, 3 answers out of 3)."""
+    t = schema.get("type")
+    if t == "object" and isinstance(x, dict):
+        props = schema.get("properties", {})
+        for k in schema.get("required", []):
+            if k not in x and "none" in props.get(k, {}).get("enum", []):
+                x[k] = "none"
+        for k, sub in props.items():
+            if k in x:
+                x[k] = fill_none(x[k], sub)
+    elif t == "array" and "items" in schema and isinstance(x, list):
+        x = [fill_none(v, schema["items"]) for v in x]
+    return x
+
+
 def schema_errors(x, schema: dict, path: str = "$") -> list[str]:
     """What in `x` does not match `schema` (the JSON-schema subset of this file: types, enums, required)."""
     t = schema.get("type")
@@ -264,7 +281,7 @@ class Qwen:
             reply = self._generate(messages, sample=attempt > 0)
             m = re.search(r"\{.*\}", reply, re.S)
             try:
-                answer = json.loads(m.group(0)) if m else None
+                answer = fill_none(json.loads(m.group(0)), schema) if m else None
                 errs = schema_errors(answer, schema) if answer is not None else ["no JSON object in the answer"]
                 errs = errs or (check(answer) if check else [])
             except json.JSONDecodeError as e:

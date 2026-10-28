@@ -5,9 +5,11 @@
 #   2  launch/prepare_egotouch.sh KEY       extraction and the Qwen3-VL-4B scene (data/egotouch/scene/KEY.json)
 #   3  launch/reconstruct.sh KEY RECON      DEPTH=da3 HAND_CONTACT=1, both hands placed, object and frame from the scene
 #   4  prepare_reference.py --scene         data/references/NAME: the hand from the scene's hands_used
+#   5  check_reference.py                   data/references/NAME/quality.json (contact, slip, wrist)
 #
 # Env: KEY (EgoTouch key)  NAME  RECON=data/egotouch/recon/KEY_readme (the MoGe one, data/egotouch/recon/KEY, kept)
-#      MAX_WRIST_Z=1.0
+#      MAX_WRIST_Z=1.0  QUALITY=enforce|report (a rejected reference fails the job, or is only reported)
+#      SAM3_POINT_START=1
 # Submitted by launch/submit_readme.sh.
 #SBATCH -J et_refs_readme
 #SBATCH -A iyg@h100
@@ -44,10 +46,9 @@ OUT=data/references/$NAME
     --out "$OUT" --clearance-mode frame --hand-table-clearance 0.008 \
     --object-trajectory keyframes --anchor vision --object-target dense --overwrite 2>&1 | grep --line-buffered -v '^profiling'
 ls -l "$OUT/reference.npz"
-"$PY_SIM" -c "
-import numpy as np, sys
-z = np.load('$OUT/reference.npz', allow_pickle=True)['wrist_pos'][:, 2]
-print(f'wrist height above the table: median {np.median(z):.2f} m, max {z.max():.2f} m (gate {sys.argv[1]} m)')
-sys.exit(0 if z.max() <= float(sys.argv[1]) else 'implausible hand placement: see $RECON/hands_overlay_cotracker.mp4')" \
-    "${MAX_WRIST_Z:-1.0}"
+echo "##### 5 quality card (scripts/rl/check_reference.py) #####"
+# QUALITY=enforce: a rejected reference fails the job, so its trainings never start; report: they start anyway
+ENF=(); [ "${QUALITY:-enforce}" = enforce ] && ENF=(--enforce)
+"$PY_SIM" scripts/rl/check_reference.py --recon "$RECON" --reference "$OUT" --scene "$SCENE" \
+    --max-wrist-z "${MAX_WRIST_Z:-1.0}" "${ENF[@]}" 2>&1 | grep --line-buffered -v '^profiling'
 echo "=== done: $OUT ==="

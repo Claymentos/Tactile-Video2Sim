@@ -56,6 +56,8 @@
 #          DEPTH=moge|da3 (step 3's depth model; video.json records it)
 #          RECGEN_EROSION=1  SAM3_OFFLOAD=1  SMOOTH_WINDOW=9
 #          HAND_CONTACT=1 (step 9)  CONTACT_ARGS="--touch-contacts 2 --finger-radius 0.01" (hand_object_contact.py)
+#          OBJECT_PROMPTS="a;b" (SAM3's prompts after OBJECT when its mask is empty; default the scene's description and
+#          the EgoTouch manifest's name)
 #          SKIP_FRAMES=1 SKIP_SAM3=1 SKIP_DEPTH=1 SKIP_CAMERA=1 SKIP_MOCAP=1 SKIP_MESH=1 SKIP_OBJECT=1
 set -eo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
@@ -77,7 +79,7 @@ in_env() { local py="$1"; shift; PATH="$(dirname "$py"):$PATH" "$py" "$@"; }
 
 # the episode folder, the object and the reference frame
 # '|'-separated: a tab is IFS whitespace, and an empty field (no scene file: no object) would vanish
-IFS='|' read -r EP_DIR STAMP TASK FPS SCENE_OBJ SCENE_FRAME < <("$PY_SIM" -c "
+IFS='|' read -r EP_DIR STAMP TASK FPS SCENE_OBJ SCENE_FRAME ALT_PROMPTS < <("$PY_SIM" -c "
 import json, sys; sys.path.insert(0, 'src')
 from pathlib import Path
 from tv2s_data.scene import manipulated_object
@@ -90,11 +92,16 @@ else:
     from tv2s_data.egotouch import FPS, episode_from_key
     ep = episode_from_key('$EGOTOUCH_ROOT', '$KEY')
     ep_dir, stamp, task, fps = ep.dir, ep.stamp, ep.task, FPS
-obj, frame = '', 0
+obj, frame, alt = '', 0, []
 if Path('$SCENE').exists():
     o = manipulated_object(json.load(open('$SCENE')))
     obj, frame = o['id'].replace('_', ' '), int(round(float(o.get('visible_at_s') or 0) * fps))
-print(ep_dir, stamp, task, fps, obj, frame, sep='|')")
+    alt.append(str(o.get('description') or '').strip().rstrip('.'))
+if '$DATASET' == 'egotouch' and Path('$EGOTOUCH_ROOT', 'manifest.jsonl').exists():   # the dataset's own name
+    rel = str(Path(ep_dir).relative_to('$EGOTOUCH_ROOT'))
+    alt += [r['object'] for r in map(json.loads, open(Path('$EGOTOUCH_ROOT', 'manifest.jsonl'))) if r['episode'] == rel]
+alt = [a.replace('|', ' ').replace(';', ',') for a in dict.fromkeys(alt) if a and a != obj]
+print(ep_dir, stamp, task, fps, obj, frame, ';'.join(alt), sep='|')")
 OBJECT="${OBJECT:-$SCENE_OBJ}"
 n="${FRAME:-$SCENE_FRAME}"
 [ -n "$OBJECT" ] || { echo "no scene file $SCENE: OBJECT=\"<object>\" (or run semantic_parsing.py)"; exit 1; }
@@ -151,6 +158,14 @@ fi
 if [ "${SKIP_SAM3:-0}" != "1" ]; then
     echo "=== 2/8 SAM3: object '$OBJECT', static '$STATIC_PROMPT' ==="
     in_env "$PY_SAM3" $R/segment_video_sam3.py "${OFFLOAD[@]}" --video "$VIDEO_PATH" --text "$OBJECT" --obj_id "$OBJ_ID" --frame_idx "$n"
+    # SAM3 can miss the scene's id (pick_up_peeler/094431 'peeler'): the scene's description, then the manifest's
+    # name, under the same id (the files downstream keep the scene's name)
+    IFS=';' read -r -a ALTS <<< "${OBJECT_PROMPTS-$ALT_PROMPTS}"
+    for alt in "${ALTS[@]}"; do
+        mask_ok "$REF_MASKS/$OBJ_ID.png" && break
+        echo "  no '$OBJECT' at frame $n: SAM3 again with '$alt'"
+        in_env "$PY_SAM3" $R/segment_video_sam3.py "${OFFLOAD[@]}" --video "$VIDEO_PATH" --text "$alt" --obj_id "$OBJ_ID" --frame_idx "$n"
+    done
     table_points() {   # TABLE_POINTS
         local labels; labels="$(tr ';' '\n' <<< "$1" | sed 's/.*/1/' | paste -sd';')"
         in_env "$PY_SAM3" $R/segment_video_sam3.py "${OFFLOAD[@]}" --video "$VIDEO_PATH" --points "$1" --point_labels "$labels" \

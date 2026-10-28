@@ -131,7 +131,8 @@ def main():
     print("Propagating through video...")
     outputs_per_frame = {}
     request = dict(type="propagate_in_video", session_id=session_id)
-    if args.text is None:                 # a point prompt marks no frame as prompted: start from it explicitly
+    # a point prompt marks no frame as prompted: start from it explicitly (SAM3_POINT_START=0: SAM3's own choice)
+    if args.text is None and os.environ.get("SAM3_POINT_START", "1") == "1":
         request["start_frame_index"] = args.frame_idx
     for resp in predictor.handle_stream_request(request):
         outputs_per_frame[resp["frame_index"]] = resp["outputs"]

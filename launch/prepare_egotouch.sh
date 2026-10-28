@@ -13,6 +13,7 @@
 # Knobs:   DOWNLOAD=1 TASKS=pick_up_bottle,twist_bottle_cap PER_TASK=5   MODEL=gemini-3.6-flash  GEMINI_FPS=4
 #          VLM=qwen (local Qwen-VL instead of Gemini; MODEL: a Hugging Face Qwen-VL, default Qwen/Qwen3-VL-4B-Instruct)
 #          SKIP_PARSE=1  OVERWRITE=1  OUT=data/egotouch
+#          MANIFEST_SCENE=1 (default: an episode whose parsing fails gets a minimal scene from manifest.jsonl; 0: none)
 set -eo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 cd "$REPO"
@@ -45,8 +46,25 @@ for e in select_episodes('$EGOTOUCH_ROOT', '$EPISODES' or None):
         print(e.key, e.video, context(e), sep='\t')" | while IFS=$'\t' read -r key video ctx; do
         out="$OUT/scene/$key.json"
         if [ -e "$out" ]; then echo "  $key: exists"; continue; fi
-        "${PARSE[@]}" --video "$video" --out "$out" --fps "${GEMINI_FPS:-4}" --context "$ctx" < /dev/null \
-            || echo "  $key: parsing failed"
+        "${PARSE[@]}" --video "$video" --out "$out" --fps "${GEMINI_FPS:-4}" --context "$ctx" < /dev/null && continue
+        [ "${MANIFEST_SCENE:-1}" = "1" ] || { echo "  $key: parsing failed"; continue; }
+        # the VLM failed: a minimal scene from the dataset's manifest (its object and hand, the object from the
+        # first frame, the table), so that the reconstruction still runs; "model": "manifest" marks it
+        "$PY_SIM" -c "
+import json, sys
+from pathlib import Path
+root, key, video, out = sys.argv[1:]
+task, stamp = key.split('__')
+rows = [json.loads(l) for l in open(Path(root) / 'manifest.jsonl')]
+r = [r for r in rows if r['episode'].split('/')[1:] == [task, stamp]]
+if not r: sys.exit(f'  {key}: parsing failed, and not in {root}/manifest.jsonl')
+r = r[0]
+scene = dict(video=video, model='manifest', hands_used=r['side'], hands_reason='EgoTouch manifest.jsonl',
+             objects=[dict(id=r['object'].replace(' ', '_'), description=r['object'], visible_at_s=0.0, is_static=False),
+                      dict(id='table', description='the table', visible_at_s=0.0, is_static=True)])
+json.dump(scene, open(out, 'w'), indent=1)
+print(f'  {key}: parsing failed: the manifest\'s scene ({r[\"object\"]}, {r[\"side\"]} hand) -> {out}')" \
+            "$EGOTOUCH_ROOT" "$key" "$video" "$out"
     done
 fi
 echo "episodes: $OUT/episodes   scenes: $OUT/scene   next: launch/rl_recon.sh <name> <key>"

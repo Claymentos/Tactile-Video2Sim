@@ -309,7 +309,9 @@ def train_policy(method: str, exp_name: str, env_name: str, num_envs: int, cli_o
     videos = RolloutVideos(REPO / "scripts" / "policy" / "visualize_episode.py", exp_name, run_dir,
                            runner_args.video_interval, start=env_args.eval_start) if runner_args.video_interval > 0 else None
     mapping = env_args.tactile.mapping
-    wandb_init = dict(name=exp_name, group=os.environ.get("WANDB_RUN_GROUP") or None,
+    # $WANDB_RUN_NAME: the name shown in wandb (e.g. egotouch_pick_up_hammer_franka), the experiment's otherwise;
+    # logs/<exp>/ (and its wandb_id) stay keyed by the experiment
+    wandb_init = dict(name=os.environ.get("WANDB_RUN_NAME") or exp_name, group=os.environ.get("WANDB_RUN_GROUP") or None,
                       job_type="train", tags=[method, mapping, env_name],
                       config=dict(method=method, mapping=mapping, env_name=env_name, num_envs=num_envs,
                                   env=json.loads(env_args.model_dump_json()), algo=json.loads(algo.model_dump_json()),
