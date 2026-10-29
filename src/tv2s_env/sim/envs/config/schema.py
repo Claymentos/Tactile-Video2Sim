@@ -113,7 +113,19 @@ class RlReconEnvArgs(BaseModel):
     # tactile reward
     tac_reach_weight: float = 0.5              # r_tactile = (1 - w) soft F1 + w reach shaping
     tac_reach_scale: float = 0.02
-    tactile_reward: bool = True                # False: w_tac counts as 0 (ablation, train.py --no-tactile; still logged)
+    # "dextag": DexTaG's tactile terms instead (hand_imitator_terms.py) on the glove's 21 x 21 cell grid, per hand
+    #   r_img  exp(-k_img e) min(1, n/10): e the fingertip-weighted L1, on the glove's contact cells, between the sim
+    #          and glove pressure images, each normalised by its peak (floored at min_max), gamma, 3x3 Gaussian blur
+    #   r_prox sum over the fingers the glove reads contact on of exp(-k_prox max(d, 0)), d the finger's taxel distance
+    #   r_tactile = (r_img + w_prox r_prox) / (1 + 5 w_prox)   (DexTaG's scales 50 / 25, in [0, 1])
+    tac_reward: Literal["recon", "dextag"] = "recon"
+    tac_img_k: float = 4.0
+    tac_prox_k: float = 50.0
+    tac_prox_weight: float = 0.5
+    tac_gamma: float = 0.5
+    tac_min_max: float = 1.0                   # pressure units: sim 1 = a taxel on the surface, glove 1 = glove_scale raw
+    tac_fingertip_weight: float = 3.0
+    tactile_reward: bool = True               # False: w_tac counts as 0 (ablation, train.py --no-tactile; still logged)
     glove_obs: bool = True                     # False: the GT glove contacts ahead are zeroed (train.py --no-glove-obs)
     # reward weights / scales
     w_tac: float = 1.5

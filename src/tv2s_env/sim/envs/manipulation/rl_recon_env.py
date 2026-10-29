@@ -399,7 +399,62 @@ class RlReconEnv(BaseEnv):
             raise ValueError(f"the hands' gloves have different channel counts: {[s.n_channels for s in self.sensors]}")
         self.n_channels = self.sensors[0].n_channels
         self.sdf = [MeshDistance(p, self.device, voxel=self._args.sdf_voxel, signed=True) for p in self.collision_paths]
+        if self._args.tac_reward == "dextag":
+            self._build_glove_images()
         self._clear_starts()
+
+    def _build_glove_images(self) -> None:
+        """DexTaG's tactile images on the glove's cell grid: per hand the (channel, cell) pairs of its taxels, the
+        cells' weights (fingertip_weight on the finger cells, mean 1 over the grid as DexTaG) and the channels of
+        each finger."""
+        a = self._args
+        z = [np.load(p, allow_pickle=False) for p in self.taxel_paths]
+        rows, cols = (max(int(zz["cell_rc"][:, i].max()) for zz in z) + 1 for i in (0, 1))
+        self.glove_grid = (rows, cols)
+        self.glove_cell, self.glove_chan, weights, fingers = [], [], [], []
+        for zz in z:
+            pairs = np.unique(np.stack([zz["channel"], zz["cell_rc"][:, 0] * cols + zz["cell_rc"][:, 1]], 1), axis=0)
+            self.glove_chan.append(torch.as_tensor(pairs[:, 0], device=self.device))
+            self.glove_cell.append(torch.as_tensor(pairs[:, 1], device=self.device))
+            w = np.ones(rows * cols, dtype=np.float32)
+            region = {int(c): str(r) for c, r in zip(zz["channel"], zz["region"])}
+            w[[cell for c, cell in pairs if region[int(c)] != "palm"]] = a.tac_fingertip_weight
+            weights.append(w * w.size / w.sum())
+            fingers.append([[region.get(c) == f for c in range(self.n_channels)]
+                            for f in ("thumb", "index", "middle", "ring", "little")])
+        self.glove_weight = torch.as_tensor(np.stack(weights), device=self.device)            # (H, R*C)
+        self.glove_finger = torch.as_tensor(np.array(fingers), device=self.device)            # (H, 5, C)
+        g = torch.exp(-torch.arange(-1.0, 2.0, device=self.device) ** 2 / 2)
+        self.glove_blur = (g[:, None] * g[None, :] / (g.sum() ** 2)).reshape(1, 1, 3, 3)
+
+    def _glove_image(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-channel values (B, H, C) -> DexTaG's preprocessed images (B, H, R*C): each cell its channel's value,
+        normalised by the map's peak (floored at tac_min_max), gamma, 3x3 Gaussian blur."""
+        a, (R, C) = self._args, self.glove_grid
+        B = x.shape[0]
+        img = torch.zeros(B, self.H, R * C, device=self.device)
+        for h in range(self.H):
+            img[:, h].index_copy_(1, self.glove_cell[h], x[:, h, self.glove_chan[h]])
+        img = (img / img.amax(-1, keepdim=True).clamp(min=a.tac_min_max)).clamp(0, 1) ** a.tac_gamma
+        img = torch.nn.functional.conv2d(img.reshape(B * self.H, 1, R, C), self.glove_blur, padding=1)
+        return img.reshape(B, self.H, R * C)
+
+    def _dextag_tactile(self, d: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """DexTaG's WeightedGaussianBlurredTactileMapSimilarityReward and TactileGatedFingertipSurfaceProximityReward
+        per hand (B, H), against the glove's contacts y and its pressure (cleaned: its contact channels only)."""
+        a, (R, C) = self._args, self.glove_grid
+        target = self.target_pressure * y / a.tactile.glove_scale
+        cur, tgt = self._glove_image(self.tactile_pressure), self._glove_image(target)
+        mask = torch.zeros_like(cur)
+        for h in range(self.H):
+            mask[:, h].index_copy_(1, self.glove_cell[h], (target[:, h, self.glove_chan[h]] > 0).float())
+        w = self.glove_weight * mask
+        err = ((tgt - cur).abs() * w).sum(-1) / w.sum(-1).clamp(min=1)
+        r_img = torch.exp(-a.tac_img_k * err) * (mask.sum(-1) / 10).clamp(max=1)
+        touch = ((y[:, :, None] > 0) & self.glove_finger).any(-1)                              # (B, H, 5)
+        d_finger = torch.where(self.glove_finger, d[:, :, None], torch.full_like(d[:, :, None], float("inf"))).amin(-1)
+        r_prox = (torch.exp(-a.tac_prox_k * d_finger.clamp(min=0)) * touch).sum(-1)
+        return r_img, r_prox
 
     @torch.no_grad()
     def _clear_starts(self) -> None:
@@ -545,6 +600,9 @@ class RlReconEnv(BaseEnv):
         reach = (torch.exp(-(d - c.probe_radius).clamp(min=0) / a.tac_reach_scale) * y).sum(-1) / n_y.clamp(min=1)
         reach = torch.where(n_y > 0, reach, torch.ones_like(reach))
         r_tac = ((1 - a.tac_reach_weight) * f1_soft + a.tac_reach_weight * reach).mean(-1)
+        if a.tac_reward == "dextag":
+            r_img, r_prox = self._dextag_tactile(d, y)
+            r_tac = ((r_img + a.tac_prox_weight * r_prox) / (1 + 5 * a.tac_prox_weight)).mean(-1)
         sim_contact = d < c.probe_radius
         tp = (sim_contact & (y > 0)).sum(-1).float()
 
@@ -593,6 +651,8 @@ class RlReconEnv(BaseEnv):
                     e_obj_3d=mean_task(err.norm(dim=-1)), e_obj_3d_max=(err.norm(dim=-1) * task).amax(-1),
                     obj_height=mean_task(self.all_object_pos[..., 2] - self.ref["obj_pos"][0, 0, :, 2]),
                     tac_tp=tp.sum(-1), tac_sim=sim_contact.sum((-1, -2)).float(), tac_real=n_y.sum(-1))
+        if a.tac_reward == "dextag":
+            out.update(r_tac_img=r_img.mean(-1), r_tac_prox=r_prox.mean(-1))
         if a.arm.enabled:
             arm, hand = a.arm, self.hands[0]
             e_arm_q = (self.arm_q - self.ref_at("arm_q", t)).norm(dim=-1)                  # (B, H)
@@ -635,6 +695,7 @@ class RlReconEnv(BaseEnv):
             e_obj=m["e_obj_3d"], e_obj_depth=m["e_obj_depth"], e_obj_end=m["e_obj_3d_max"],
             e_obj_across=m["e_obj_across"], e_obj_along=m["e_obj_along"], e_axis=m["e_axis"], obj_height=m["obj_height"],
             obj_valid=torch.ones(self._num_envs, device=self.device),
+            **{k: m[k] for k in ("r_tac_img", "r_tac_prox") if k in m},
             assist=torch.full((self._num_envs,), self.assist_scale, device=self.device))
 
     def get_extra_infos(self) -> dict[str, Any]:

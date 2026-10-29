@@ -22,12 +22,16 @@ if [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH/venvs/genesis" ]; then
     [ -x "$SCRATCH/venvs/da3/bin/python" ] && PY_DA3="${PY_DA3:-$SCRATCH/venvs/da3/bin/python}"
     [ -d "$WORK/ext/recgen" ] && export RECGEN_DIR="${RECGEN_DIR:-$WORK/ext/recgen}"
     [ -d "$WORK/ext/MoGe" ] && MOGE_REPO="${MOGE_REPO:-$WORK/ext/MoGe}"
+    [ -x "$SCRATCH/conda/envs/sam3d/bin/python" ] && PY_SAM3D="${PY_SAM3D:-$SCRATCH/conda/envs/sam3d/bin/python}"
+    [ -d "$WORK/ext/sam-3d-objects" ] && SAM3D_DIR="${SAM3D_DIR:-$WORK/ext/sam-3d-objects}"
 fi
 # Genesis 1.3.3 times its two constraint solvers on 2 calls and, on an H100, keeps the decomposed (CUDA graph) one,
 # 13x slower here than the monolith (rl_recon, 2048 envs: 4.4k vs 60k env steps/s, the same physics)
 export QD_PERFDISPATCH_FORCE="${QD_PERFDISPATCH_FORCE:-func_solve_body:func_solve_body_monolith}"
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
 PY_DATA="${PY_DATA:-$CONDA_BASE/envs/lerobot/bin/python}"              # pandas + pyarrow (parquet)
+PY_SAM3D="${PY_SAM3D:-$CONDA_BASE/envs/sam3d-objects/bin/python}"        # SAM 3D Objects (reconstruct.sh MESH_MODEL=sam3d)
+SAM3D_DIR="${SAM3D_DIR:-$HOME/sam-3d-objects}"                             # its checkout, checkpoints in checkpoints/hf
 PY_RETARGET="${PY_RETARGET:-$CONDA_BASE/envs/wuji_retargeting/bin/python}"   # pinocchio + wuji_retargeting
 PY_SIM="${PY_SIM:-$CONDA_BASE/envs/genesis/bin/python}"                # genesis-world, torch, trimesh
 PY_GEMINI="${PY_GEMINI:-$CONDA_BASE/envs/sam3d/bin/python}"            # google-genai (semantic_parsing.py)

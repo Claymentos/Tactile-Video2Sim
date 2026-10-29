@@ -23,6 +23,8 @@
 #                  rescale of the depth into the hands' metres                         [PY_SAM3, PY_HAWOR, PY_SIM]
 #   6  table       the table plane from the reference depth                                           [PY_SIM]
 #   7  mesh        RecGen from the reference frame's RGB, depth and mask, without mask erosion       [PY_RECGEN]
+#                  (MESH_MODEL=sam3d: SAM 3D Objects on the same RGB, mask and depth, reconstruct_mesh_sam3d.py;
+#                  written to the same recgen_out_moge/<object>/, the pipeline's mesh folder)         [PY_SAM3D]
 #   8  object      CoTracker points on the object, lifted, Kabsch, composed with the camera motion into the
 #                  reference camera, Kalman-smoothed                                                  [PY_SAM3, PY_SIM]
 #   9  contact     (HAND_CONTACT=1) the hands' depth corrected along their camera rays so that the glove touches the
@@ -54,7 +56,7 @@
 #          HANDS=mocap|hawor (default: mocap on EgoTouch, hawor on ACE)  HAND_PROMPT="black glove" (SAM3, HANDS=hawor)
 #          HAND_PER_FRAME_DEPTH=0 (keep HaWoR's own per-frame depth)
 #          DEPTH=moge|da3 (step 3's depth model; video.json records it)
-#          RECGEN_EROSION=1  SAM3_OFFLOAD=1  SMOOTH_WINDOW=9
+#          MESH_MODEL=recgen|sam3d (step 7; video.json records it)  RECGEN_EROSION=1  SAM3_OFFLOAD=1  SMOOTH_WINDOW=9
 #          HAND_CONTACT=1 (step 9)  CONTACT_ARGS="--touch-contacts 2 --finger-radius 0.01" (hand_object_contact.py)
 #          OBJECT_PROMPTS="a;b" (SAM3's prompts after OBJECT when its mask is empty; default the scene's description and
 #          the EgoTouch manifest's name)
@@ -125,7 +127,9 @@ ln -sfn "$EP_DIR" "$OUT/source"
 if [ "${SKIP_DEPTH:-0}" = "1" ] && [ -e "$OUT/video.json" ]; then     # the depth kept: the model that made it
     DEPTH="$("$PY_SIM" -c "import json,sys; print(json.load(open(sys.argv[1])).get('depth', 'moge'))" "$OUT/video.json")"
 fi
-echo "{\"fps\": $FPS, \"dataset\": \"$DATASET\", \"hands\": \"$HANDS\", \"depth\": \"$DEPTH\"}" > "$OUT/video.json"
+MESH_MODEL="${MESH_MODEL:-recgen}"
+case "$MESH_MODEL" in recgen|sam3d) ;; *) echo "MESH_MODEL=recgen|sam3d" >&2; exit 1 ;; esac
+echo "{\"fps\": $FPS, \"dataset\": \"$DATASET\", \"hands\": \"$HANDS\", \"depth\": \"$DEPTH\", \"mesh\": \"$MESH_MODEL\"}" > "$OUT/video.json"
 echo "=== $KEY ($DATASET, $FPS fps, hands: $HANDS, depth: $DEPTH): object '$OBJECT', reference frame $n -> $OUT ==="
 
 VIDEO_PATH="$OUT/${TASK}_rgb.mp4"
@@ -260,11 +264,19 @@ echo "=== 6/8 table plane ==="
     --exclude "$REF_MASKS/$OBJ_ID.png" --out "$GROUND_PLANE"
 
 if [ "${SKIP_MESH:-0}" != "1" ]; then
-    echo "=== 7/8 object mesh (RecGen): $OBJECT ==="
-    EROSION=(--no-mask-erosion); [ "${RECGEN_EROSION:-0}" = "1" ] && EROSION=()
-    in_env "$PY_RECGEN" $R/reconstruct_mesh_recgen.py "${EROSION[@]}" --rgb "$FRAME_PATH" --depth "$DEPTH_DIR/$(printf "%06d.png" "$n")" \
-        --mask "$REF_MASKS/$OBJ_ID.png" --intrinsics "$INTRINSICS_YAML" --checkpoint "$RECGEN_CHECKPOINT" \
-        --out "$OUT/recgen_out_moge/$OBJ_ID" --name "$OBJ_ID"
+    if [ "$MESH_MODEL" = "sam3d" ]; then
+        echo "=== 7/8 object mesh (SAM 3D Objects): $OBJECT ==="
+        rm -rf "$OUT/recgen_out_moge/$OBJ_ID"
+        SAM3D_DIR="$SAM3D_DIR" in_env "$PY_SAM3D" $R/reconstruct_mesh_sam3d.py --rgb "$FRAME_PATH" \
+            --depth "$DEPTH_DIR/$(printf "%06d.png" "$n")" --mask "$REF_MASKS/$OBJ_ID.png" --intrinsics "$INTRINSICS_YAML" \
+            --out "$OUT/recgen_out_moge/$OBJ_ID" --name "$OBJ_ID"
+    else
+        echo "=== 7/8 object mesh (RecGen): $OBJECT ==="
+        EROSION=(--no-mask-erosion); [ "${RECGEN_EROSION:-0}" = "1" ] && EROSION=()
+        in_env "$PY_RECGEN" $R/reconstruct_mesh_recgen.py "${EROSION[@]}" --rgb "$FRAME_PATH" --depth "$DEPTH_DIR/$(printf "%06d.png" "$n")" \
+            --mask "$REF_MASKS/$OBJ_ID.png" --intrinsics "$INTRINSICS_YAML" --checkpoint "$RECGEN_CHECKPOINT" \
+            --out "$OUT/recgen_out_moge/$OBJ_ID" --name "$OBJ_ID"
+    fi
 fi
 
 if [ "${SKIP_OBJECT:-0}" != "1" ]; then
