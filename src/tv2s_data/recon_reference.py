@@ -367,40 +367,13 @@ def add_grasp_pose(reference: Path, min_contacts: int = 5, radius: float = 0.004
     np.savez(reference, **ref)
 
 
-def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: Path, min_inliers: int = 30,
-                               min_visible: int = 40, blend: int = 6, anchor: str = "vision",
-                               max_spread_deg: float = 15.0, max_spread_cm: float = 3.0, rest_tol: float = 0.04,
-                               target: str = "dense", held_weight: float = 0.5, held_margin: float = 3.0) -> None:
-    """The object's trajectory from its reliable frames only, and from the hand while it is held.
-
-    CoTracker's object trajectory fails exactly when it matters: the grasping hand hides the object, its points slide
-    onto the glove and stay there, and the Kalman filter bridges half the clip at constant velocity
-    (pick_up_wrench/094952: poses kept on 18-46% of the held frames, a third of the points on the glove). So the clip
-    is cut by the glove's holds (tv2s_data.reference.contact_holds) and the object is
-      at rest (before the first hold, between and after them)  one pose: the robust mean of its reliable poses there;
-      held                                                      the palm's pose times one offset palm -> object: the
-                                                                robust mean of the offsets on the hold's reliable frames
-                                                                (`anchor` vision) when they agree (spread under
-                                                                `max_spread_deg` and `max_spread_cm`: a held object does
-                                                                not move by more in the palm), else, or with `anchor`
-                                                                tactile, the in-palm pose that explains the glove and
-                                                                that the hand holds under physics (add_grasp_pose,
-                                                                select_grasp_pose);
-    blended over `blend` frames at each grasp and release. The glove reports a hold under a firm grip only: a stretch
-    "at rest" whose reliable poses are still away from its rest pose (> `rest_tol`) next to a hold (the object carried
-    more lightly after the release, or already lifted before the onset) is held too, until the object is seen at rest. The poses are solved again on every frame (Kabsch + RANSAC on
-    CoTracker's lifted points, no smoothing) from the points off both gloves' masks (EgoTouch masks.npz): the points
-    slide onto the glove that hides the object and stay there. A reliable frame: >= `min_visible` such points and
-    >= `min_inliers` RANSAC inliers. The tracked trajectory is kept as obj_pos_tracked / obj_rot_tracked;
-    obj_traj_source, obj_keyframes and hold_offset_spread_{deg,cm} report what was done."""
-    import trimesh
-
-    from tv2s_data.reference import contact_holds
-
-    ref = dict(np.load(reference, allow_pickle=True))
-    if "obj_pos_tracked" in ref:                 # run again: from the tracked trajectory, not the previous result
-        ref["obj_pos"], ref["obj_rot"] = ref["obj_pos_tracked"], ref["obj_rot_tracked"]
-    recon, episode = Path(recon), Path(episode)
+def measure_object_poses(ref: dict, recon: Path, obj: str, episode: Path, min_visible: int = 40):
+    """The object's pose in each frame, solved again (Kabsch + RANSAC on CoTracker's lifted points, no smoothing) from
+    the points off both gloves' masks (EgoTouch masks.npz): CoTracker's points slide onto the glove that hides the
+    object and stay on it, and a frame is then pulled towards the hand. Frames with fewer than `min_visible` such
+    points keep the composed (Kalman) trajectory and 0 inliers. Returns world (pos (T, 3), rot (T, 3, 3)), the RANSAC
+    inliers (T,), the points off the gloves (T,) and the fraction of the visible points on a glove (T,; NaN where none
+    is visible)."""
     T = len(ref["qpos"])
     C, shift, centre = ref["C"], ref["shift"], ref["obj_centre_cam"]
     comp = np.load(recon / f"{obj}_traj_composed_cotracker.npz")
@@ -436,8 +409,67 @@ def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: 
         rot_w[t] = C @ Rc @ C.T
         pos_w[t] = (Rc @ centre + tc) @ C.T + shift
         inl[t] = int(mask.sum())
+    n_vis = vis.sum(1)
+    return pos_w, rot_w, inl, off.sum(1), np.where(n_vis > 0, 1 - off.sum(1) / np.maximum(n_vis, 1), np.nan)
+
+
+def consistent_keyframes(pos: np.ndarray, rot: np.ndarray, reliable: np.ndarray, window: int = 3, min_neighbours: int = 2,
+                         max_cm: float = 2.0, max_deg: float = 10.0) -> np.ndarray:
+    """The reliable frames that agree with their reliable neighbours within +-`window` frames: within `max_cm` of
+    their median position and `max_deg` of their mean rotation (a held object moves smoothly; a frame off by more
+    is a RANSAC fit on a few points, or on points that slid onto the glove)."""
+    T, kf = len(pos), np.zeros(len(pos), bool)
+    for t in np.flatnonzero(reliable):
+        nb = [s for s in range(max(0, t - window), min(T, t + window + 1)) if s != t and reliable[s]]
+        if len(nb) < min_neighbours:
+            continue
+        dp = np.linalg.norm(pos[t] - np.median(pos[nb], 0)) * 100
+        m = Rotation.from_matrix(rot[nb]).mean()
+        dr = np.degrees((m.inv() * Rotation.from_matrix(rot[t])).magnitude())
+        kf[t] = dp <= max_cm and dr <= max_deg
+    return kf
+
+
+def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: Path, min_inliers: int = 30,
+                               min_visible: int = 40, blend: int = 6, anchor: str = "vision",
+                               max_spread_deg: float = 15.0, max_spread_cm: float = 3.0, rest_tol: float = 0.04,
+                               target: str = "dense", held_weight: float = 0.5, held_margin: float = 3.0) -> None:
+    """The object's trajectory from its reliable frames only, and from the hand while it is held.
+
+    CoTracker's object trajectory fails exactly when it matters: the grasping hand hides the object, its points slide
+    onto the glove and stay there, and the Kalman filter bridges half the clip at constant velocity
+    (pick_up_wrench/094952: poses kept on 18-46% of the held frames, a third of the points on the glove). So the clip
+    is cut by the glove's holds (tv2s_data.reference.contact_holds) and the object is
+      at rest (before the first hold, between and after them)  one pose: the robust mean of its reliable poses there;
+      held                                                      the palm's pose times one offset palm -> object: the
+                                                                robust mean of the offsets on the hold's reliable frames
+                                                                (`anchor` vision) when they agree (spread under
+                                                                `max_spread_deg` and `max_spread_cm`: a held object does
+                                                                not move by more in the palm), else, or with `anchor`
+                                                                tactile, the in-palm pose that explains the glove and
+                                                                that the hand holds under physics (add_grasp_pose,
+                                                                select_grasp_pose);
+    blended over `blend` frames at each grasp and release. The glove reports a hold under a firm grip only: a stretch
+    "at rest" whose reliable poses are still away from its rest pose (> `rest_tol`) next to a hold (the object carried
+    more lightly after the release, or already lifted before the onset) is held too, until the object is seen at rest. The poses are solved again on every frame (Kabsch + RANSAC on
+    CoTracker's lifted points, no smoothing) from the points off both gloves' masks (EgoTouch masks.npz): the points
+    slide onto the glove that hides the object and stay there. A reliable frame: >= `min_visible` such points and
+    >= `min_inliers` RANSAC inliers. The tracked trajectory is kept as obj_pos_tracked / obj_rot_tracked;
+    obj_traj_source, obj_keyframes and hold_offset_spread_{deg,cm} report what was done; the measured poses themselves
+    are kept as obj_pos_measured / obj_rot_measured with their RANSAC inliers (obj_inliers) and obj_kf, the reliable
+    frames consistent with their neighbours (consistent_keyframes): the poses eval_rl_recon.py scores the object on."""
+    import trimesh
+
+    from tv2s_data.reference import contact_holds
+
+    ref = dict(np.load(reference, allow_pickle=True))
+    if "obj_pos_tracked" in ref:                 # run again: from the tracked trajectory, not the previous result
+        ref["obj_pos"], ref["obj_rot"] = ref["obj_pos_tracked"], ref["obj_rot_tracked"]
+    recon, episode = Path(recon), Path(episode)
+    T = len(ref["qpos"])
+    pos_w, rot_w, inl, _, on_glove = measure_object_poses(ref, recon, obj, episode, min_visible)
     reliable = inl >= min_inliers
-    on_glove = 1 - off.sum(1) / np.maximum(vis.sum(1), 1)
+    kf = consistent_keyframes(pos_w, rot_w, reliable)
     def robust_mean(R, p):
         """Rotation mean and median translation of the poses within 2 x the median angle of the first mean."""
         rots = Rotation.from_matrix(R)
@@ -554,13 +586,14 @@ def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: 
     z0 = (V @ out_R[0].T + out_p[0])[:, 2].min()
     err = np.linalg.norm(out_p - pos_w, axis=1)[reliable]
     print(f"object trajectory from keyframes: {reliable.sum()}/{T} reliable frames (>= {min_inliers} inliers among the "
-          f"points off the gloves; {np.median(on_glove[vis.sum(1) > 0]) * 100:.0f}% of the visible points on a glove, "
+          f"points off the gloves; {np.nanmedian(on_glove) * 100:.0f}% of the visible points on a glove, "
           f"median); " + "; ".join(report))
     print(f"  against the tracked poses on the reliable frames: median {np.median(err) * 100:.1f} cm; "
           f"lowest point at frame 0: z = {z0 * 100:.1f} cm")
     ref.update(obj_pos_tracked=ref["obj_pos"], obj_rot_tracked=ref["obj_rot"], obj_pos=out_p, obj_rot=out_R,
                obj_valid=np.ones(T, bool), obj_weight=obj_weight, obj_margin_scale=obj_margin_scale,
-               obj_measured=measured, obj_target=target, obj_rest_z=-z0, obj_traj_source=source.astype(str), obj_keyframes=reliable,
+               obj_measured=measured, obj_target=target,
+               obj_pos_measured=pos_w, obj_rot_measured=rot_w, obj_inliers=inl, obj_kf=kf, obj_rest_z=-z0, obj_traj_source=source.astype(str), obj_keyframes=reliable,
                hold_offset_spread_deg=np.array([s[0] for s in spreads]), hold_offset_spread_cm=np.array([s[1] * 100 for s in spreads]))
     np.savez(reference, **ref)
 

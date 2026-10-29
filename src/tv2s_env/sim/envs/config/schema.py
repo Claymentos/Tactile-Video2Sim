@@ -133,6 +133,17 @@ class RlReconEnvArgs(BaseModel):
     obj_rot_weight: float = 0.0                # hinge on the full rotation error (off, as rl_recon)
     obj_rot_margin: float = 0.6
     obj_depth_discount: float = 3.0            # the object error along the camera ray counts 1/x (termination)
+    # the object's target: "dense", the reference's trajectory on every frame (held: the reference palm times one
+    # offset); "keyframes", only its measured poses (obj_kf / obj_pos_measured / obj_rot_measured, prepare_reference.py
+    # or scripts/rl/add_object_keyframes.py), within kf_window frames of a keyframe, margins x (1 + kf_window_margin x
+    # the frames to it); the observation then gives the next keyframe's pose and the time to it, and the object
+    # terminates an episode only there
+    obj_reward: Literal["dense", "keyframes"] = "dense"
+    kf_window: int = 3
+    kf_window_margin: float = 0.5
+    kf_rot_weight: float = 1.0                 # keyframes: the full rotation's hinge (measured there: 2-11 deg median
+    kf_rot_margin: float = 0.35                # noise on the resting objects, 17 deg p90), off in "dense"
+    kf_mask_axis: bool = True                  # keyframes: the SAM3 mask's axis still scores every frame it is valid
     # episodes. Training starts: "first" where evaluation starts (frame 0, or the first frame where the reference
     # hands clear the resting objects), to the clip end; "random": anywhere (the options below)
     train_start: Literal["first", "random"] = "first"

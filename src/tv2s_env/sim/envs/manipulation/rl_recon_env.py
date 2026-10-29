@@ -52,6 +52,10 @@ Franka arm (`arm.enabled`, franka_wuji.py): each hand on a Panda standing on the
 
 Additions for this pipeline's references, off on Benchmark-Genesis' (`start_clearance` of the reference): starts
 need the reference taxels `start_clearance` away from every resting object (else it is ejected at the reset).
+`obj_reward=keyframes`: the object terms score the object against its measured poses only (the reference's obj_kf
+keyframes, within kf_window frames, margins widening away from them, plus the full rotation's hinge), not against
+the dense trajectory (held: the reference palm times one offset); the observation gives the next keyframe's pose and
+the time to it, and the object terminates an episode only near a keyframe.
 """
 
 from pathlib import Path
@@ -247,6 +251,9 @@ class RlReconEnv(BaseEnv):
             ref["arm_q"] = np.stack([pl["q"] for pl in self.arm_placement], 1)                  # (T, H, 7)
             ref["arm_dq"] = np.gradient(ref["arm_q"], axis=0) * self.hz                         # fed forward
 
+        if a.obj_reward == "keyframes":
+            ref.update(self._keyframe_targets(path, T, N))
+
         # tensors (1, T, ...): ref[key][env_clip, t] reads every env's frame
         f = lambda x: torch.as_tensor(np.asarray(x), dtype=torch.float32, device=self.device)[None]
         self.ref = {k: f(v) for k, v in ref.items() if k not in ("holding", "held", "focus", "obj_valid")}
@@ -257,6 +264,9 @@ class RlReconEnv(BaseEnv):
         self.ref["contact"] = self.ref["real_contact"]
         axis_ref = self.ref["obj_rot"][0] @ torch.as_tensor(self.obj_axis_np, dtype=torch.float32, device=self.device)[..., None]
         self.ref["axis_img"] = self._image_axis(axis_ref[..., 0], self.ref["obj_pos"][0] - self.ref["head_pos"][0][:, None])[None]
+        if a.obj_reward == "keyframes":
+            axis_kf = self.ref["kf_next_rot"][0] @ torch.as_tensor(self.obj_axis_np, dtype=torch.float32, device=self.device)[..., None]
+            self.ref["kf_next_axis_img"] = self._image_axis(axis_kf[..., 0], self.ref["kf_next_pos"][0] - self.ref["head_pos"][0][:, None])[None]
         self.mask_axis = None
         if "mask_axis_2d" in r:                          # Benchmark-Genesis' mask_axes.py: the orientation target
             g = lambda x: torch.as_tensor(np.asarray(x), dtype=torch.float32, device=self.device)
@@ -274,6 +284,32 @@ class RlReconEnv(BaseEnv):
     def ref_at(self, key: str, t: torch.Tensor) -> torch.Tensor:
         """Reference `key` at frames t (B,), clamped to the clip."""
         return self.ref[key][0, t.clamp(0, self.T - 1)]
+
+    def _keyframe_targets(self, path: Path, T: int, N: int) -> dict:
+        """obj_reward=keyframes: per frame t (T, N, ...), the nearest keyframe's measured pose, a weight 1 within
+        kf_window frames of it (else 0) and its margin scale; the next keyframe's pose and the time to it (s; 0 after
+        the last), for the observation. One object (this pipeline's references)."""
+        a = self._args
+        z = np.load(path, allow_pickle=True)
+        missing = [k for k in ("obj_kf", "obj_pos_measured", "obj_rot_measured") if k not in z.files]
+        if missing or N != 1:
+            raise ValueError(f"{path}: obj_reward=keyframes needs one object and {missing or 'its keyframes'} "
+                             "(scripts/rl/add_object_keyframes.py)")
+        ks = np.flatnonzero(np.asarray(z["obj_kf"][:T], bool))
+        if not len(ks):
+            raise ValueError(f"{path}: no object keyframe")
+        P, R = np.asarray(z["obj_pos_measured"])[:T], np.asarray(z["obj_rot_measured"])[:T]
+        t = np.arange(T)
+        i = np.clip(np.searchsorted(ks, t), 1, len(ks) - 1)
+        near = np.where(np.abs(ks[i - 1] - t) <= np.abs(ks[i] - t), ks[i - 1], ks[i]) if len(ks) > 1 else np.full(T, ks[0])
+        dist = np.abs(near - t)
+        nxt = ks[np.minimum(np.searchsorted(ks, t), len(ks) - 1)]
+        print(f"object reward on {len(ks)} keyframes (+-{a.kf_window} frames: {np.count_nonzero(dist <= a.kf_window)}/{T} frames scored)")
+        return dict(kf_pos=P[near][:, None], kf_rot=R[near][:, None], kf_quat=_rotmats_to_quats(R[near])[:, None],
+                    kf_weight=(dist <= a.kf_window).astype(float)[:, None],
+                    kf_margin_scale=(1 + a.kf_window_margin * dist)[:, None],
+                    kf_next_pos=P[nxt][:, None], kf_next_rot=R[nxt][:, None],
+                    kf_next_dt=(np.maximum(nxt - t, 0) / self.hz)[:, None])
 
     # ================================================================== scene
     def _build_scene(self, show_viewer: bool) -> None:
@@ -351,8 +387,9 @@ class RlReconEnv(BaseEnv):
             g.set_dofs_position(q, self._ghost_dofs[h], envs_idx=envs, zero_velocity=True)
         for k, g in enumerate(self.object_ghosts):
             if g is not None:
-                g.set_pos(self.ref_at("obj_pos", self.t)[:, k], envs_idx=envs, zero_velocity=True)
-                g.set_quat(self.ref_at("obj_quat", self.t)[:, k], envs_idx=envs, zero_velocity=True)
+                pk, qk = ("kf_pos", "kf_quat") if self._args.obj_reward == "keyframes" else ("obj_pos", "obj_quat")
+                g.set_pos(self.ref_at(pk, self.t)[:, k], envs_idx=envs, zero_velocity=True)
+                g.set_quat(self.ref_at(qk, self.t)[:, k], envs_idx=envs, zero_velocity=True)
 
     def _build_sensors(self) -> None:
         t = self._args.tactile
@@ -475,7 +512,8 @@ class RlReconEnv(BaseEnv):
         self.target_fingertip_pos = self.target_keypoints[..., 2::3, :]
         self.target_contact = self.ref_at("contact", t) > 0.5
         self.target_pressure = self.ref_at("real_raw", t)
-        self.target_all_object_pos, self.target_all_object_rot = self.ref_at("obj_pos", t), self.ref_at("obj_rot", t)
+        pk, rk = ("kf_pos", "kf_rot") if self._args.obj_reward == "keyframes" else ("obj_pos", "obj_rot")
+        self.target_all_object_pos, self.target_all_object_rot = self.ref_at(pk, t), self.ref_at(rk, t)
         ray = self.target_all_object_pos - self.ref_at("head_pos", t)[:, None]
         self.camera_ray = ray / ray.norm(dim=-1, keepdim=True).clamp(min=1e-6)            # (B, N, 3)
 
@@ -514,7 +552,11 @@ class RlReconEnv(BaseEnv):
         valid = self.ref_at("obj_valid", t).float() * task                                  # (B, N)
         # the reference's per-frame weight and margin scale of the object terms (keyframe_object_trajectory: strict
         # where the object's pose is measured, loose while it is only assumed in the hand)
-        weight, mscale = self.ref_at("obj_weight", t), self.ref_at("obj_margin_scale", t)
+        keyframes = a.obj_reward == "keyframes"
+        if keyframes:                   # only near the measured keyframes, margins widening away from them
+            weight, mscale = self.ref_at("kf_weight", t), self.ref_at("kf_margin_scale", t)
+        else:
+            weight, mscale = self.ref_at("obj_weight", t), self.ref_at("obj_margin_scale", t)
         n_task = task.sum()
         err = self.all_object_pos - self.target_all_object_pos                              # (B, N, 3)
         along = (err * self.camera_ray).sum(-1)
@@ -522,7 +564,11 @@ class RlReconEnv(BaseEnv):
         e_obj = torch.sqrt(across ** 2 + (along / a.obj_depth_discount) ** 2)
         e_obj_rot = rotation_angle(self.all_object_rot.transpose(-1, -2) @ self.target_all_object_rot)
         axis_img = self._image_axis((self.all_object_rot @ self.obj_axis[None, :, :, None])[..., 0], self.camera_ray)
-        e_axis = 2 * torch.asin(((axis_img - self.ref_at("axis_img", t)).norm(dim=-1) / 2).clamp(max=1.0))
+        if keyframes:                   # the keyframe's measured axis
+            axis_tgt = self._image_axis((self.target_all_object_rot @ self.obj_axis[None, :, :, None])[..., 0], self.camera_ray)
+        else:
+            axis_tgt = self.ref_at("axis_img", t)
+        e_axis = 2 * torch.asin(((axis_img - axis_tgt).norm(dim=-1) / 2).clamp(max=1.0))
         valid_axis = valid * weight
         if self.mask_axis is not None:
             tt = t.clamp(0, self.T - 1)
@@ -530,16 +576,18 @@ class RlReconEnv(BaseEnv):
             e_axis = torch.where(self.mask_valid[tt], e_mask, e_axis)
             # the masks' axis is measured in the image itself: it scores the frames the reference trajectory leaves
             # out too (a reference whose object target is set on its measured frames only)
-            valid_axis = torch.maximum(valid * weight, self.mask_valid[tt].float() * task)
+            if not keyframes or a.kf_mask_axis:
+                valid_axis = torch.maximum(valid * weight, self.mask_valid[tt].float() * task)
         hinge_pos = ((across - a.obj_margin_across * mscale).clamp(min=0) / a.obj_scale_across
                      + (along.abs() - a.obj_margin_along * mscale).clamp(min=0) / a.obj_scale_along)
+        rot_w, rot_m = (a.kf_rot_weight, a.kf_rot_margin) if keyframes else (a.obj_rot_weight, a.obj_rot_margin)
         hinge_rot = ((e_axis - a.obj_axis_margin).clamp(min=0) / a.obj_axis_scale
-                     + valid * weight * a.obj_rot_weight * (e_obj_rot - a.obj_rot_margin).clamp(min=0) / 0.5)
+                     + valid * weight * rot_w * (e_obj_rot - rot_m * (mscale if keyframes else 1.0)).clamp(min=0) / 0.5)
         p_pos = ((1 - torch.exp(-hinge_pos)) * valid * weight).sum(-1) / n_task
         p_axis = ((1 - torch.exp(-hinge_rot)) * valid_axis).sum(-1) / n_task
         mean_task = lambda x: (x * task).sum(-1) / n_task
         out = dict(r_hand=r_hand, r_tac=r_tac, p_pos=p_pos, p_axis=p_axis, f1_soft=f1_soft.mean(-1),
-                    e_wrist_h=e_wrist, e_kp_h=e_kp, e_obj_task=e_obj * valid,
+                    e_wrist_h=e_wrist, e_kp_h=e_kp, e_obj_task=e_obj * valid * ((weight > 0).float() if keyframes else 1.0),
                     e_rot=e_rot.mean(-1), e_human=e_human.mean(-1), e_axis=mean_task(e_axis),
                     e_obj_across=mean_task(across), e_obj_along=mean_task(along.abs()), e_obj_depth=mean_task(e_obj),
                     e_obj_3d=mean_task(err.norm(dim=-1)), e_obj_3d_max=(err.norm(dim=-1) * task).amax(-1),
@@ -609,9 +657,14 @@ class RlReconEnv(BaseEnv):
         rel = ((self.object_pos - self.base_pos)[..., None, :] @ self.base_rot)[..., 0, :]
         oR_p = self.base_rot.transpose(-1, -2) @ self.object_rot
         axis = (self.object_rot @ self.obj_axis[self._focus][..., None])[..., 0]
+        if a.obj_reward == "keyframes":     # the next measured pose and the time to it, no target in between
+            target = [flat(gather(self.ref_at("kf_next_pos", t1)) - self.object_pos), flat(self.object_pos[..., 2:]),
+                      flat(gather(self.ref_at("kf_next_axis_img", t1))), flat(gather(self.ref_at("kf_next_dt", t1)))]
+        else:
+            target = [flat(gather(self.ref_at("obj_pos", t1)) - self.object_pos), flat(self.object_pos[..., 2:]),
+                      flat(gather(self.ref_at("axis_img", t1)))]
         parts += [flat(rel), flat(oR_p[..., :2]), flat(self.object_lin_vel), flat(0.1 * self.object_ang_vel),
-                  flat(gather(self.ref_at("obj_pos", t1)) - self.object_pos), flat(self.object_pos[..., 2:]),
-                  flat(gather(self.ref_at("axis_img", t1))), flat(axis)]
+                  *target, flat(axis)]
         c = a.tactile
         d = self.tactile_distance
         parts += [flat(torch.sigmoid((c.probe_radius - d) / c.soft_tau)), flat(torch.tanh(d / 0.03))]

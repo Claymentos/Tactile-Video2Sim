@@ -60,9 +60,9 @@ def time_map(ratio: np.ndarray, frac: float, widen: int, smooth: float) -> tuple
     return np.asarray(u), s
 
 
-def resample(v: np.ndarray, u: np.ndarray) -> np.ndarray:
+def resample(v: np.ndarray, u: np.ndarray, nearest: bool = False) -> np.ndarray:
     T = v.shape[0]
-    if v.dtype.kind in "biuUSO":                                # booleans, integers, strings: nearest frame
+    if nearest or v.dtype.kind in "biuUSO":                     # booleans, integers, strings: nearest frame
         return v[np.clip(np.round(u).astype(int), 0, T - 1)]
     i0 = np.clip(np.floor(u).astype(int), 0, T - 1)
     i1 = np.minimum(i0 + 1, T - 1)
@@ -104,8 +104,13 @@ def main() -> None:
     for k, v in list(z.items()):
         if k == "grasp_frames":
             z[k] = np.unique(np.searchsorted(u, np.asarray(v, float)))
+        elif k == "obj_kf":            # a keyframe stays one frame: the new frame nearest to it, not every copy of it
+            kf = np.zeros(len(u), bool)
+            kf[np.abs(u[:, None] - np.flatnonzero(v)[None]).argmin(0)] = True
+            z[k] = kf
         elif isinstance(v, np.ndarray) and v.ndim and v.shape[0] == T and not k.startswith("grasp_candidates"):
-            z[k] = resample(v, u)
+            # the measured object poses stay measurements: each new frame takes its nearest frame's (its keyframe flag too)
+            z[k] = resample(v, u, nearest=k in ("obj_pos_measured", "obj_rot_measured"))
     z["source_frame"] = u
     z["retime_slowdown"] = np.interp(u, np.arange(T), s)
 
