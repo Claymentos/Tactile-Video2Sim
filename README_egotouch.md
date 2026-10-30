@@ -481,6 +481,107 @@ python scripts/policy/visualize_episode.py --exp et_hammer --run logs/et_hammer/
     --checkpoint logs/et_hammer/<time>/checkpoints/checkpoint_00500.pt --out outputs/test_video
 ```
 
+## 8. Corrections de la reconstruction et outils de diagnostic (29/10/2026)
+
+Mesures faites sur le marteau `pick_up_hammer__20260321_095958_211` (DA3 + contact).
+
+### 8.1 Rotation de la main placée dans la caméra (`HAND_ROTATION=drift`, par défaut) — validé
+
+**Problème.** Le placement `smooth` (`place_mocap_hands.py`) laissait la rotation monde mocap → caméra libre à chaque frame. Elle suivait le bruit de WiLoR et faisait tourner la main entière. Roulis de la main gauche autour de l'avant-bras : +372° sur le clip, dont +215° dans les 2 s après le relâchement, contre −11° dans le Rokoko brut. Conséquences : main qui fait un tour sur elle-même dans le rejeu, IK du Franka cassée après la manipulation (11,7 cm / 78°), pic de vitesse artificiel à 3,65× la limite du Panda.
+
+**Correction.** Une seule rotation pour le clip (moyenne robuste des PnP par frame, celles trop éloignées écartées), puis une correction lente rappelée vers zéro (`--rotation-prior 3000`). Les translations restent libres par frame. `HAND_ROTATION=free` (ou `--rotation free`) redonne l'ancien comportement.
+
+| | avant | après |
+|---|---|---|
+| roulis de la main gauche sur le clip (Rokoko : −11°) | +372° | −12° |
+| écart max avec le Rokoko en cours de clip | 384° | 2° |
+| reprojection médiane sur WiLoR | 7,9 px | 9,7 px |
+| IK du bras après la manipulation | 11,7 cm / 78° | 0,1 cm / 0° |
+| clip après retiming | 21,9 s | 18,6 s |
+
+Force de rappel testée : 300 laisse 126° d'écart en cours de clip, 1000 en laisse 77°, 3000 en laisse 2°.
+
+Pour l'appliquer à une reconstruction existante (placement des mains, table et contact refaits ; profondeur, caméra, mesh et objet gardés), puis refaire la référence :
+```bash
+SKIP_FRAMES=1 SKIP_SAM3=1 SKIP_DEPTH=1 SKIP_CAMERA=1 SKIP_MESH=1 SKIP_OBJECT=1 \
+DEPTH=da3 HAND_CONTACT=1 HANDS=mocap HAND_SIDES="left right" HAND_PLACEMENT=smooth HAND_POSE_SMOOTH=4 \
+HAND_DEPTH=moge HAND_KNOT_FRAMES=10 \
+    launch/reconstruct.sh $KEY data/egotouch/recon/$KEY
+python scripts/rl/prepare_reference.py --recon data/egotouch/recon/$KEY --scene data/egotouch/scene/$KEY.json \
+    --out data/references/$NAME --clearance-mode frame --hand-table-clearance 0.008 \
+    --object-trajectory keyframes --anchor vision --object-target dense --overwrite
+```
+
+### 8.2 Scène mise à l'échelle au contact (`HAND_DEPTH=pnp` → `--scene-scale contact`) — expérimental, pas encore utilisable pour le RL
+
+**Problème.** La main de référence ne touche pas l'objet à la saisie (écart de 11 cm après la correction de contact actuelle), d'où la saisie dans le vide en RL. Mesuré à la frame de saisie : la taille réelle de la main dans l'image la place à **86 cm** de la caméra, la profondeur DA3 sous le gant à 122 cm, le marteau à 146 cm (mesh de 43 cm pour un marteau d'environ 30 cm). Sur l'ensemble du clip, profondeur et taille de la main s'accordent (rapport médian 1,01) : c'est près de la table que la profondeur est trop loin. Corriger seulement la main (λ) bute sur la table, car l'objet au repos est lui-même sous la table (centre à −1,8 cm, point le plus bas à −9 cm).
+
+**Correction.** Avec `HAND_DEPTH=pnp`, la main est placée à sa taille réelle (le placement `smooth` suit alors la profondeur de la PnP, plus la carte de profondeur). Puis `hand_object_contact.py --scene-scale contact` cherche le facteur μ qui, appliqué autour de la caméra de référence à tout ce qui vient de la profondeur (mesh posé, trajectoires et points de l'objet, plan de table, mouvement de la caméra), amène l'objet contre la main au contact. Les projections dans l'image sont inchangées. Les originaux sont copiés dans `before_contact/` et remis en place au début de chaque passage, et par `reconstruct.sh` avant toute relance des étapes 3 à 8 (`hand_object_contact.py --recon <recon> --undo` le fait à la main).
+
+**Résultat sur le marteau.**
+
+| | avant | après (μ = 0,63) |
+|---|---|---|
+| écart main–objet à la saisie | 11,1 cm | 1,0 cm |
+| longueur du mesh | 43 cm | 27 cm (scène : ~30 cm) |
+| main avant la saisie par rapport à la table | — | environ 2 cm sous la table (cohérent) |
+| main pendant la tenue par rapport à la table | — | **médiane 9 cm sous la table, jusqu'à 33 cm** |
+
+**Limite qui bloque.** Pendant la tenue, la main fermée autour du manche donne une profondeur par sa taille très bruitée (87 à 128 cm d'une frame à l'autre), et la rotation monde mocap → caméra, estimée sur des orientations WiLoR bruitées (22° d'écart médian), fait descendre sous la table une main qui monte. `prepare_reference.py` relève alors la main de 27 cm en médiane, ce qui recrée l'écart. Essayé sans succès : lissage de la translation sur 30 et 60 frames (main encore 9 cm sous la table en médiane) ; placement `global` à la taille réelle de la main (diverge : main à 3,4 m). Piste suivante : corriger la profondeur elle-même avant les étapes 4 à 8 (une correction affine de la profondeur, ajustée sur les frames où la main ouverte donne une distance fiable par sa taille), pour que main, objet et table soient cohérents sur tout le clip.
+
+### 8.3 Constats de diagnostic
+
+- **Distorsion de la caméra poitrine** : les bords de table sont courbés (6 à 8 px de flèche), mais la mocap placée ne montre aucun biais radial par rapport à WiLoR (−0,2 à +1,2 px jusqu'à 260 px du centre, la zone des mains). La distorsion n'explique pas l'écart main–objet ; pas de calibration pour l'instant.
+- **Gant EgoTouch** : coussinets au bout des doigts seulement (position 0,75 à 0,95 le long du doigt), 91 cellules de paume, 15 capteurs de flexion, fond déjà soustrait dans `pressure_grids.npz`. 12 cellules de paume côté pouce (colonnes 17 à 19) ne sont pas reportées sur la Wuji alors qu'elles sont actives 91 % de la tenue du marteau (12 % de la pression de la paume). Les capteurs de flexion ne sont pas utilisés. `manual_contact_annotation.json` contredit le gant (`left_contact: false`) : ne pas s'en servir.
+
+### 8.4 Outils
+
+```bash
+# planche de vérification du gant d'un épisode : carte, cellules reportées sur la Wuji, instantanés avec la vidéo,
+# courbes par région et flexion -> outputs/glove/<key>_<side>_glove.png (+ résumé dans le terminal)
+python scripts/data/inspect_egotouch_glove.py --key pick_up_hammer__20260321_095958_211 [--side left]
+
+# envoyer après coup sur wandb un run lancé sans TV2S_WANDB=1 (progress.csv, évaluations eval/first|in_hand/*,
+# vidéos ; wandb >= 0.30 n'a plus `wandb sync --sync-tensorboard`)
+python scripts/policy/upload_wandb.py logs/<exp>/<time>
+```
+
+Rappel : sans `TV2S_WANDB=1` dans la commande d'entraînement, rien n'est envoyé à wandb pendant le run.
+
+### 8.5 Banc de test : notre RL sur les données mesurées de DexTaG (30/10/2026)
+
+But : séparer la reconstruction du RL. DexTaG mesure la main (gant EMF + Quest) et l'objet (FoundationPose sur
+RealSense RGB-D, mesh scanné `hammer_scanned_collision.obj`, 27 cm). Si notre RL reproduit une démonstration DexTaG,
+les échecs EgoTouch viennent de la reconstruction ; sinon, du RL.
+
+`scripts/data/dextag_to_reference.py` convertit un `.pkl` de `dextag_trajectories.zip` en `reference.npz` :
+- **main et objet tels quels** : les angles DexTaG suivent l'ordre de notre modèle Wuji, et les bouts de doigts
+  retombent à 4–11 mm de MANO avec notre URDF comme avec le leur ;
+- **60 → 30 Hz** ;
+- **gant** : un canal par pixel 24×32 (352 pixels). Les taxels de `full_hand_tactile_v5.json` sont reportés dans nos
+  repères de liens, dans `assets/tactile/wuji_taxels_right_dextag.npz`. Contact à partir de 60 en brut (leur seuil
+  de bruit) ;
+- **pose de tenue** : moyenne de paume⁻¹ · objet sur les frames tenues ;
+- **tête** fixe (`--head`), puisque la pose de leur caméra n'est pas dans les données ;
+- **`--object-offset`** décale l'objet, pour mesurer l'erreur main–objet que le RL absorbe.
+
+Constats sur `hammer_mixed/20260201_165843_353314` :
+- la main de référence passe à 0,1 cm de l'objet posé au moment de la saisie, contre 1,6 à 4,9 cm sur nos
+  références EgoTouch (§ précédents) ;
+- leur tactile n'est pas parfaitement aligné non plus : les taxels des canaux en contact sont à environ 1,8 cm de
+  l'objet, avec leur URDF comme avec le nôtre ;
+- rejouée sans policy (résidu nul), la main suit sa référence à moins de 2 cm, pousse le marteau sans le soulever,
+  et aucun taxel simulé ne touche. Le RL doit donc fermer la main, même sur des données mesurées.
+
+```bash
+python scripts/data/dextag_to_reference.py \
+    --pkl ~/DexTaG/data/dextag_trajectories/hammer_mixed/pickles_filtered/20260201_165843_353314.pkl \
+    --out data/references/dextag_hammer_165843
+python scripts/reconstruction/replay_raw_genesis.py --reference data/references/dextag_hammer_165843/reference.npz
+TV2S_WANDB=1 SKIP_SCENE=1 SKIP_RECON=1 SKIP_REFERENCE=1 TRAIN_ARGS="--env.arm.enabled=True" \
+    launch/rl_recon.sh dextag_hammer_165843_arm dextag
+```
+
 ## Jean Zay (SLURM)
 
 Par démonstration à une main (`hands_used` = left ou right dans la scène) : un job perception (scène + référence), puis deux jobs PPO, avec et sans récompense tactile, dans un même groupe wandb (hors ligne).

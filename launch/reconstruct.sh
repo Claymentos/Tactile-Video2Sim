@@ -31,6 +31,10 @@
 #                  object at rest when it grasps it and lets it go: MoGe's near / far depth disagree (the screwdriver:
 #                  the glove 14 cm in front of the object it touches); the image projection is unchanged
 #                  (hand_object_contact.py: mocap_joints_cotracker_raw.npz kept, hand_contact.json)  [PY_SIM]
+#                  With HAND_DEPTH=pnp (the hands at their measured size), the scene comes to the hands instead: the
+#                  object, the table and the camera motion scaled about the reference camera by the factor that brings
+#                  the object to the glove (--scene-scale contact; originals in before_contact/, put back before any
+#                  rerun of the steps above)
 # The object (its SAM3 prompt) and the reference frame come from the scene file (semantic_parsing.py): the object
 # the hands manipulate, when it is first visible. Then: scripts/rl/prepare_reference.py --recon <out> (or
 # launch/rl_recon.sh, which runs this first), scripts/reconstruction/replay_raw_genesis.py --reference.
@@ -52,7 +56,7 @@
 #          HAND_PLACEMENT=smooth|per-frame|global (smooth, default: the placement varying smoothly over time, fitted on
 #          WiLoR's joints, the gloves' masks and the depth of every frame together; per-frame: the measured hand placed on
 #          WiLoR in every frame and smoothed; global: one similarity for the whole clip, Benchmark-Genesis')
-#          HAND_KNOT_FRAMES=10 (smooth)  HAND_POSE_SMOOTH=4 (frames)  HAND_DEPTH=moge|pnp
+#          HAND_KNOT_FRAMES=10 (smooth)  HAND_POSE_SMOOTH=4 (frames)  HAND_DEPTH=moge|pnp  HAND_ROTATION=drift|free
 #          HANDS=mocap|hawor (default: mocap on EgoTouch, hawor on ACE)  HAND_PROMPT="black glove" (SAM3, HANDS=hawor)
 #          HAND_PER_FRAME_DEPTH=0 (keep HaWoR's own per-frame depth)
 #          DEPTH=moge|da3 (step 3's depth model; video.json records it)
@@ -197,6 +201,10 @@ for mask in "$REF_MASKS/$OBJ_ID.png" "$REF_MASKS/$STATIC_ID.png"; do
     mask_ok "$mask" || { echo "empty mask at the reference frame: $mask (FRAME=, OBJECT=, TABLE_POINTS=)" >&2; exit 1; }
 done
 
+if [ -e "$OUT/before_contact/scale.json" ]; then   # step 9's scene scale undone: the steps below start from the depth's
+    "$PY_SIM" $R/hand_object_contact.py --recon "$OUT" --undo
+fi
+
 echo "=== 3/8 intrinsics (MoGe) and depth ($DEPTH) ==="
 INTRINSICS_INFO="$(in_env "$PY_MOGE" $R/estimate_intrinsics_moge.py --image "$FRAME_PATH" --checkpoint "$MOGE_CHECKPOINT" \
     "${MOGE_REPO_ARG[@]}" --out "$INTRINSICS_YAML")"
@@ -237,7 +245,7 @@ place_hands() {  # [--fixed-scale S]
         --depth-dir "$DEPTH_DIR" --frames-dir "$FRAMES_DIR" --overlay "$OUT/hands_overlay_cotracker.mp4" \
         --transform-out "$MOCAP_FIT" --out "$MOCAP_JOINTS" --sides ${HAND_SIDES:-left right} --scale-from "${HAND_SCALE_FROM:-hands}" \
         --placement "${HAND_PLACEMENT:-smooth}" --pose-smooth "${HAND_POSE_SMOOTH:-4}" --hand-depth "${HAND_DEPTH:-moge}" \
-        --knot-frames "${HAND_KNOT_FRAMES:-10}" \
+        --knot-frames "${HAND_KNOT_FRAMES:-10}" ${HAND_ROTATION:+--rotation "$HAND_ROTATION"} \
         ${HAND_FIT_FRAMES:+--fit-frames "$HAND_FIT_FRAMES"} ${HAND_DRIFT_KNOTS:+--drift-knots "$HAND_DRIFT_KNOTS"} "$@"
 }
 if [ "${SKIP_MOCAP:-0}" != "1" ]; then
@@ -289,7 +297,10 @@ fi
 if [ "${HAND_CONTACT:-0}" = "1" ]; then
     echo "=== 9 hands' depth from the glove's contacts with the object ==="
     SCENE_ARG=(); [ -e "$SCENE" ] && SCENE_ARG=(--scene "$SCENE")
+    # hands at their measured size (HAND_DEPTH=pnp): the object, the table and the camera motion come to them
+    SCALE_ARG=(); [ "${HAND_DEPTH:-moge}" = "pnp" ] && SCALE_ARG=(--scene-scale contact)
     # shellcheck disable=SC2086
-    "$PY_SIM" $R/hand_object_contact.py --recon "$OUT" --object "$OBJ_ID" --episode "$EP_DIR" "${SCENE_ARG[@]}" ${CONTACT_ARGS:-}
+    "$PY_SIM" $R/hand_object_contact.py --recon "$OUT" --object "$OBJ_ID" --episode "$EP_DIR" "${SCENE_ARG[@]}" \
+        "${SCALE_ARG[@]}" ${CONTACT_ARGS:-}
 fi
 echo "reconstruction: $OUT   check: hands_wilor_check.mp4, video_segmentation/tracked_*.mp4, ${OBJ_ID}_points_cotracker.mp4"

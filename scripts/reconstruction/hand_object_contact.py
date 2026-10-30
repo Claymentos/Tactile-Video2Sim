@@ -24,8 +24,20 @@ an anchor is left as it is). MoGe's error varies over the clip, so one lam can p
 (pick_up_wrench/094952: the grasp asks 1.12, the table allows 1.06 twenty frames later): in every frame lam is also
 kept under the one that puts the hand's lowest joint --table-clearance above the table (ground_plane_moge.json),
 that bound min-filtered and smoothed over time; a hand already under the table is not moved up here
-(prepare_reference.py's clearance lift does it). The object, the table and the camera are not moved: the table
-defines the simulated world and the object rests on it.
+(prepare_reference.py's clearance lift does it).
+
+--scene-scale contact (launch/reconstruct.sh with HAND_DEPTH=pnp): the hands are placed at their measured size, and the
+scene is moved to them instead. The depth is what is off: on pick_up_hammer/095958 the hand's size puts it 86 cm from
+the camera at the grasp, the depth under it 122 cm, the hammer 146 cm (its mesh 43 cm long for a ~30 cm hammer), and
+the hand moved along its rays to the object went through the table. So first, at the same anchors, the factor mu
+(nearest 1 in [--mu-min, --mu-max], median over the anchors) that scales everything lifted from the depth about the
+reference camera, p -> mu p, so that the hand's bone points come --finger-radius from the object at rest: the object
+(posed mesh, trajectories, CoTracker points), the table plane and the camera's motion. Projections are unchanged, the
+object stays on its mask and on the table, and its size follows (there: mu 0.62, the mesh 27 cm, the hand ~0 cm from
+the hammer and a few cm above the table before the grasp). The hands, in the reference camera, follow the camera
+motion's rescale (their pose in each frame's camera is kept). The files are copied to before_contact/ first and put
+back at the start of every run (and by --undo, which launch/reconstruct.sh calls before it reruns any step), so that
+runs do not compound. The depth maps themselves are left as they are. Then the hands' lam as above, now near 1.
 
 Reads (and keeps on its first run) mocap_joints_cotracker_raw.npz, the placement of place_mocap_hands.py or
 place_video_hands.py, so that it can be run again; rewrites mocap_joints_cotracker.npz (joints and bone points) and
@@ -33,6 +45,7 @@ writes hand_contact.json. Then scripts/rl/prepare_reference.py --overwrite (the 
 
 Run in the `genesis` env:
     python scripts/reconstruction/hand_object_contact.py --recon data/egotouch/recon/<key> [--object screwdriver]
+        [--scene-scale contact]
 """
 
 import argparse
@@ -68,6 +81,12 @@ def parse_args():
     ap.add_argument("--lam-min", type=float, default=0.7)
     ap.add_argument("--lam-max", type=float, default=1.5)
     ap.add_argument("--faces", type=int, default=4000, help="the object's mesh decimated to this for the distances")
+    ap.add_argument("--scene-scale", choices=("off", "contact"), default="off",
+                    help="contact: scale what the depth gave (object, table, camera motion) so that the object meets the "
+                    "hands at their measured size (module docstring); off: only the hands move")
+    ap.add_argument("--mu-min", type=float, default=0.4)
+    ap.add_argument("--mu-max", type=float, default=1.6)
+    ap.add_argument("--undo", action="store_true", help="put back the files an earlier --scene-scale scaled, and stop")
     return ap.parse_args()
 
 
@@ -130,9 +149,116 @@ def table_bound(joints, centres, plane, clearance, window=15, sigma=3.0):
     return np.where(finite, np.minimum(smooth, lam), np.inf)
 
 
+def touches(n, holds, T, touch_contacts):
+    """Each hold's first and last touch: (kind, frame, the rest stretch's frames, whether its rest pose is taken from
+    the stretch's start), the hold extended while >= touch_contacts channels fire."""
+    bounds = [0] + [x for h in holds for x in h] + [T]                          # rest stretches between the holds
+    out = []
+    for k, (a, b) in enumerate(holds):
+        first = a
+        while first > 0 and n[first - 1] >= touch_contacts:
+            first -= 1
+        last = b - 1
+        while last + 1 < T and n[last + 1] >= touch_contacts:
+            last += 1
+        out += [("grasp", first, np.arange(bounds[2 * k], a), True),
+                ("release", last, np.arange(b, bounds[2 * k + 3]), False)]
+    return out
+
+
+def scene_files(recon: Path, obj: str) -> list[tuple[str, tuple[str, ...]]]:
+    """What --scene-scale moves, relative to the reconstruction, with the npz keys (or file kind) it scales."""
+    files = [("camera_traj_cotracker.npz", ("translation",)), ("table_points_cotracker.npz", ("points_3d",)),
+             ("ground_plane_moge.json", ("plane",)), (f"recgen_out_moge/{obj}/posed_mesh.obj", ("obj",)),
+             (f"{obj}_traj_cotracker.npz", ("translation", "camera_translation")),
+             (f"{obj}_traj_composed_cotracker.npz", ("translation", "camera_translation")),
+             (f"{obj}_traj_camera_cotracker.npz", ("translation",)), (f"{obj}_points_cotracker.npz", ("points_3d",))]
+    return [(f, k) for f, k in files if (recon / f).exists()]
+
+
+def undo_scene_scale(recon: Path) -> float | None:
+    """The files of an earlier --scene-scale put back from before_contact/; its mu, or None if there was none."""
+    backup = recon / "before_contact"
+    if not (backup / "scale.json").exists():
+        return None
+    record = json.loads((backup / "scale.json").read_text())
+    for f in record["files"]:
+        shutil.copy(backup / f, recon / f)
+    shutil.rmtree(backup)
+    return float(record["mu"])
+
+
+def apply_scene_scale(recon: Path, obj: str, mu: float) -> list[str]:
+    """Everything lifted from the depth scaled by mu about the reference camera (module docstring), the originals
+    copied to before_contact/ first."""
+    backup = recon / "before_contact"
+    files = scene_files(recon, obj)
+    for f, _ in files:
+        (backup / f).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(recon / f, backup / f)
+    for f, keys in files:
+        path = recon / f
+        if keys == ("plane",):
+            gp = json.loads(path.read_text())
+            gp["offset"] = float(gp["offset"]) * mu                              # n . p + offset = 0, p -> mu p
+            path.write_text(json.dumps(gp, indent=2))
+        elif keys == ("obj",):
+            lines = []
+            for line in path.read_text().splitlines():
+                if line.startswith("v "):
+                    v = line.split()
+                    line = " ".join(["v"] + [f"{float(x) * mu:.6f}" for x in v[1:4]] + v[4:])
+                lines.append(line)
+            path.write_text("\n".join(lines) + "\n")
+        else:
+            data = dict(np.load(path, allow_pickle=True))
+            for k in keys:
+                if k in data:
+                    data[k] = data[k] * mu
+            np.savez(path, **data)
+    (backup / "scale.json").write_text(json.dumps(dict(mu=mu, files=[f for f, _ in files]), indent=1))
+    return [f for f, _ in files]
+
+
+def scene_gap(points, off, mu, R, t, query):
+    """Smallest distance (m) of the hand's points to the object's surface at rest pose (R, t), the scene scaled by
+    each `mu`: the object goes to mu (R x + t), the hand (fixed in its frame's camera) shifts by (1 - mu) off, off the
+    camera's translation seen from the reference camera. (len(mu),)"""
+    out = []
+    for m in mu:
+        local = ((points + (1 - m) * off) / m - t) @ R
+        _, d, _ = query(local)
+        out.append(m * d.min())
+    return np.array(out)
+
+
+def solve_mu(points, off, R, t, query, radius, mu_min, mu_max):
+    """The scene's factor nearest 1 putting the hand `radius` from the object, or None."""
+    grid = np.linspace(mu_min, mu_max, int(round((mu_max - mu_min) / 0.005)) + 1)
+    f = scene_gap(points, off, grid, R, t, query) - radius
+    roots = []
+    for i in np.flatnonzero(np.sign(f[:-1]) != np.sign(f[1:])):
+        a, b = grid[i], grid[i + 1]
+        for _ in range(20):
+            m = 0.5 * (a + b)
+            if np.sign(scene_gap(points, off, [m], R, t, query)[0] - radius) == np.sign(f[i]):
+                a = m
+            else:
+                b = m
+        roots.append(0.5 * (a + b))
+    return min(roots, key=lambda x: abs(x - 1)) if roots else None
+
+
 def main() -> None:
     args = parse_args()
     recon = Path(args.recon).resolve()
+    if args.undo:
+        mu = undo_scene_scale(recon)
+        print(f"[contact] the scene put back from its scale x{mu:.3f}" if mu else "[contact] no scene scale to undo")
+        return
+    undone = undo_scene_scale(recon)                       # an earlier run's: runs must not compound
+    if undone is not None:
+        print(f"[contact] the scene put back from an earlier scale x{undone:.3f}")
     episode = Path(args.episode).expanduser().resolve() if args.episode else (recon / "source").resolve()
     objs = [p.name[: -len("_traj_cotracker.npz")] for p in sorted(recon.glob("*_traj_cotracker.npz"))]
     objs = [o for o in objs if (recon / "recgen_out_moge" / o / "posed_mesh.obj").exists()]
@@ -147,71 +273,105 @@ def main() -> None:
         used = json.loads(Path(args.scene).read_text()).get("hands_used")
         sides = list(SIDES) if used in (None, "both") else [used]
 
-    raw = recon / "mocap_joints_cotracker_raw.npz"
+    raw =recon / "mocap_joints_cotracker_raw.npz"
     if not raw.exists():
         shutil.copy(recon / "mocap_joints_cotracker.npz", raw)
     hands = dict(np.load(raw, allow_pickle=True))
-    cam = np.load(recon / "camera_traj_cotracker.npz")
-    centres = -np.einsum("tji,tj->ti", cam["rotation"], cam["translation"])     # camera t's centre, reference camera
-    traj = np.load(recon / f"{obj}_traj_cotracker.npz")
-    Rt, tt = traj["rotation"], traj["translation"]
-    ok = traj["valid"].astype(bool) & traj["measured"].astype(bool)
-    mesh = trimesh.load(recon / "recgen_out_moge" / obj / "posed_mesh.obj", force="mesh", process=False)
-    if len(mesh.faces) > args.faces:
-        mesh = mesh.simplify_quadric_decimation(face_count=args.faces)
-    query = trimesh.proximity.ProximityQuery(mesh).on_surface
-    centre = np.asarray(mesh.centroid)
-    obj_centre = np.einsum("tij,j->ti", Rt, centre) + tt                       # the object's centre per frame
-    T = min(len(Rt), len(hands["left_joints"]))
-    plane = None
-    if args.table_clearance >= 0 and (recon / "ground_plane_moge.json").exists():
-        gp = json.loads((recon / "ground_plane_moge.json").read_text())
-        normal = np.asarray(gp["normal_camera"], dtype=float)
-        plane = (normal / np.linalg.norm(normal), float(gp["offset"]) / np.linalg.norm(normal))
+    gloves = {s: load_real_channels(episode / "pressure_grids.npz", s, dict(np.load(taxels_path(s))))[1] for s in sides}
 
+    def load_scene():
+        cam = np.load(recon / "camera_traj_cotracker.npz")
+        traj = np.load(recon / f"{obj}_traj_cotracker.npz")
+        mesh = trimesh.load(recon / "recgen_out_moge" / obj / "posed_mesh.obj", force="mesh", process=False)
+        if len(mesh.faces) > args.faces:
+            mesh = mesh.simplify_quadric_decimation(face_count=args.faces)
+        plane = None
+        if args.table_clearance >= 0 and (recon / "ground_plane_moge.json").exists():
+            gp = json.loads((recon / "ground_plane_moge.json").read_text())
+            normal = np.asarray(gp["normal_camera"], dtype=float)
+            plane = (normal / np.linalg.norm(normal), float(gp["offset"]) / np.linalg.norm(normal))
+        return (cam, traj["rotation"], traj["translation"], traj["valid"].astype(bool) & traj["measured"].astype(bool),
+                trimesh.proximity.ProximityQuery(mesh).on_surface, np.asarray(mesh.centroid), np.asarray(mesh.vertices),
+                plane)
+
+    cam, Rt, tt, ok, query, centre, mesh_v, plane = load_scene()
+    T = min(len(Rt), len(hands["left_joints"]))
     report = {"object": obj, "sides": {}}
-    for side in sides:
-        tax = dict(np.load(taxels_path(side)))
-        _, contact = load_real_channels(episode / "pressure_grids.npz", side, tax)
-        n = contact[:T].sum(1)
-        holds = contact_holds(contact[:T])
-        pts, valid = hands[f"{side}_vertices"], hands[f"{side}_valid"].astype(bool)
-        anchors, notes = [], []
-        bounds = [0] + [x for h in holds for x in h] + [T]                      # rest stretches between the holds
-        for k, (a, b) in enumerate(holds):
-            first = a
-            while first > 0 and n[first - 1] >= args.touch_contacts:
-                first -= 1
-            last = b - 1
-            while last + 1 < T and n[last + 1] >= args.touch_contacts:
-                last += 1
-            before = np.arange(bounds[2 * k], a)
-            after = np.arange(b, bounds[2 * k + 3])
-            for kind, t, frames, from_start in (("grasp", first, before, True), ("release", last, after, False)):
+
+    if args.scene_scale == "contact":
+        off = np.einsum("tji,tj->ti", cam["rotation"], cam["translation"])    # camera t's translation, reference camera
+        obj_centre = np.einsum("tij,j->ti", Rt, centre) + tt
+        found = []
+        for side in sides:
+            n = gloves[side][:T].sum(1)
+            pts, valid = hands[f"{side}_vertices"], hands[f"{side}_valid"].astype(bool)
+            for kind, t, frames, from_start in touches(n, contact_holds(gloves[side][:T]), T, args.touch_contacts):
                 pose = rest_pose(frames, Rt, tt, centre, ok, args.rest_frames, from_start)
                 if pose is None:
-                    notes.append(f"{kind} at {t}: the object is never measured at rest there")
                     continue
                 R0, p0 = pose
-                away = np.linalg.norm(obj_centre[t] - (R0 @ centre + p0))
-                if kind == "release" and away > args.rest_tol:
-                    notes.append(f"release at {t}: the tracked object is still {away * 100:.1f} cm "
-                                 f"from its rest pose (carried, or tracked on the glove): not used")
+                if kind == "release" and np.linalg.norm(obj_centre[t] - (R0 @ centre + p0)) > args.rest_tol:
                     continue
-                lams, gaps = [], []
-                for s in (t - 1, t, t + 1):
-                    if 0 <= s < T and valid[s]:
-                        gaps.append(hand_object_gap(pts[s], centres[s], np.array([1.0]), R0, p0, query)[0])
-                        lam = solve_lam(pts[s], centres[s], R0, p0, query, args.finger_radius, args.lam_min, args.lam_max)
-                        if lam is not None:
-                            lams.append(lam)
-                if not lams:
-                    notes.append(f"{kind} at {t}: no depth in [{args.lam_min}, {args.lam_max}] brings the hand to the object")
+                mus = [solve_mu(pts[s], off[s], R0, p0, query, args.finger_radius, args.mu_min, args.mu_max)
+                       for s in (t - 1, t, t + 1) if 0 <= s < T and valid[s]]
+                mus = [m for m in mus if m is not None]
+                if not mus:
                     continue
-                lam = float(np.median(lams))
-                dist = float(np.median(np.linalg.norm(pts[t] - centres[t], axis=1)))
-                anchors.append(dict(kind=kind, frame=int(t), lam=lam, gap_cm=round(float(np.median(gaps)) * 100, 1),
-                                    shift_cm=round((lam - 1) * dist * 100, 1), _pose=(R0, p0)))
+                x = dict(side=side, kind=kind, frame=int(t), mu=round(float(np.median(mus)), 4),
+                         gap_cm=round(float(scene_gap(pts[t], off[t], [1.0], R0, p0, query)[0]) * 100, 1))
+                if plane is not None:                      # the object's lowest point over the table, once scaled
+                    x["object_above_table_cm"] = round(float(x["mu"] * ((mesh_v @ R0.T + p0) @ plane[0] + plane[1]).min()) * 100, 1)
+                found.append(x)
+        if found:
+            mu = float(np.median([x["mu"] for x in found]))
+            files = apply_scene_scale(recon, obj, mu)
+            for s in SIDES:                                # the hands keep their pose in each frame's camera
+                for key in (f"{s}_joints", f"{s}_vertices"):
+                    if key in hands:
+                        m = min(len(hands[key]), len(off))
+                        hands[key][:m] = hands[key][:m] + (1 - mu) * off[:m, None]
+            cam, Rt, tt, ok, query, centre, mesh_v, plane = load_scene()
+            report["scene_scale"] = dict(mu=mu, anchors=found, files=files)
+            print(f"[contact] scene x {mu:.3f} (object, table, camera motion) so that the object meets the hands: "
+                  + ", ".join(f"{x['side']} {x['kind']} at {x['frame']} x {x['mu']:.3f} ({x['gap_cm']:.1f} cm before"
+                              + (f", object {x['object_above_table_cm']:+.1f} cm over the table" if "object_above_table_cm" in x else "")
+                              + ")" for x in found))
+        else:
+            report["scene_scale"] = dict(mu=1.0, anchors=[], note=f"no anchor in [{args.mu_min}, {args.mu_max}]")
+            print(f"[contact] scene scale: no factor in [{args.mu_min}, {args.mu_max}] brings the object to the hands")
+
+    centres = -np.einsum("tji,tj->ti", cam["rotation"], cam["translation"])     # camera t's centre, reference camera
+    obj_centre = np.einsum("tij,j->ti", Rt, centre) + tt                       # the object's centre per frame
+    for side in sides:
+        n = gloves[side][:T].sum(1)
+        holds = contact_holds(gloves[side][:T])
+        pts, valid = hands[f"{side}_vertices"], hands[f"{side}_valid"].astype(bool)
+        anchors, notes = [], []
+        for kind, t, frames, from_start in touches(n, holds, T, args.touch_contacts):
+            pose = rest_pose(frames, Rt, tt, centre, ok, args.rest_frames, from_start)
+            if pose is None:
+                notes.append(f"{kind} at {t}: the object is never measured at rest there")
+                continue
+            R0, p0 = pose
+            away = np.linalg.norm(obj_centre[t] - (R0 @ centre + p0))
+            if kind == "release" and away > args.rest_tol:
+                notes.append(f"release at {t}: the tracked object is still {away * 100:.1f} cm "
+                             f"from its rest pose (carried, or tracked on the glove): not used")
+                continue
+            lams, gaps = [], []
+            for s in (t - 1, t, t + 1):
+                if 0 <= s < T and valid[s]:
+                    gaps.append(hand_object_gap(pts[s], centres[s], np.array([1.0]), R0, p0, query)[0])
+                    lam = solve_lam(pts[s], centres[s], R0, p0, query, args.finger_radius, args.lam_min, args.lam_max)
+                    if lam is not None:
+                        lams.append(lam)
+            if not lams:
+                notes.append(f"{kind} at {t}: no depth in [{args.lam_min}, {args.lam_max}] brings the hand to the object")
+                continue
+            lam = float(np.median(lams))
+            dist = float(np.median(np.linalg.norm(pts[t] - centres[t], axis=1)))
+            anchors.append(dict(kind=kind, frame=int(t), lam=lam, gap_cm=round(float(np.median(gaps)) * 100, 1),
+                                shift_cm=round((lam - 1) * dist * 100, 1), _pose=(R0, p0)))
         anchors.sort(key=lambda x: x["frame"])
         if anchors:
             lam_t = np.interp(np.arange(len(pts)), [x["frame"] for x in anchors], [x["lam"] for x in anchors])

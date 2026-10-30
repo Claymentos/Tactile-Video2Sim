@@ -97,6 +97,17 @@ def parse_args():
                         "placed on WiLoR's 2D joints in every frame, smoothed over time (`per_frame_placement`); smooth: "
                         "that, then corrected by a placement varying smoothly over time fitted on every frame together, "
                         "with the gloves' masks where WiLoR misses the hand (`smooth_placement`)")
+    parser.add_argument("--rotation", choices=("drift", "free"), default="drift",
+                        help="per-frame / smooth: the rotation world -> reference camera. drift: one rotation for the "
+                        "clip (the robust mean of the per-frame PnPs) and, in `smooth`, a slow correction pulled back "
+                        "to it (--rotation-prior); free: the PnP's rotation in every frame. The mocap world is fixed in "
+                        "the room up to the gloves' drift, so the transform should barely turn; free, it followed "
+                        "WiLoR's noise (pick_up_hammer/095958: the left hand rolled +372 deg over the clip against "
+                        "Rokoko's -11, +215 of them in the 2 s after the release)")
+    parser.add_argument("--rotation-prior", type=float, default=3000.0,
+                        help="smooth, --rotation drift: px per rad of the correction's rotation at each knot (on "
+                        "pick_up_hammer/095958: 300 still rolled the left hand 126 deg off Rokoko within the clip, 1000 "
+                        "77 deg, 3000 2 deg for 9.7 px of median reprojection instead of 7.9)")
     parser.add_argument("--knot-frames", type=int, default=10, help="smooth: frames between two knots")
     parser.add_argument("--knot-smooth", type=float, default=1.0, help="smooth: weight of the knots' smoothness")
     parser.add_argument("--mask-weight", type=float, default=0.5,
@@ -282,7 +293,7 @@ def per_frame_placement(world, uv, ok, depth, cam_R, cam_t, K, scale, args, side
     # the transforms are smoothed and interpolated as (rotation, where the hand's mean position goes): about the
     # world's origin (~0.6 m from the hand), a turn of the transform would swing the hand along an arc
     pivot = world.reshape(-1, 3).mean(0)
-    rots, trans, wts, frames = [], [], [], []
+    rots, trans, wts, frames, cents = [], [], [], [], []
     for t in range(n):
         if ok[t].sum() < 12:
             continue
@@ -304,11 +315,26 @@ def per_frame_placement(world, uv, ok, depth, cam_R, cam_t, K, scale, args, side
         T_ct = to_matrix(scale * R, p) @ to_matrix(np.eye(3), -c)    # world -> camera t
         G = np.linalg.inv(to_matrix(cam_R[t], cam_t[t])) @ T_ct
         rots.append(G[:3, :3] / scale), trans.append(G[:3, :3] @ pivot + G[:3, 3]), wts.append(1.0 / (err + 5.0))
-        frames.append(t)
-    frames, wts, trans = np.array(frames), np.array(wts), np.array(trans)
+        frames.append(t), cents.append(c)
+    frames, wts, trans, cents = np.array(frames), np.array(wts), np.array(trans), np.array(cents)
     if len(frames) < 3:
         raise SystemExit(f"[hands] {side}: {len(frames)} frames placed, too few for the per-frame placement")
     rots = Rotation.from_matrix(np.array(rots))
+    if args.rotation == "drift":
+        # one rotation for the clip: the weighted mean of the PnPs', those far from it (flips, WiLoR's misses) left
+        # out; each kept frame keeps its hand's centroid where its PnP and the depth put it
+        R0 = rots.mean(weights=wts)
+        for _ in range(3):
+            ang = np.degrees((R0.inv() * rots).magnitude())
+            inl = ang < max(20.0, 2 * np.median(ang))
+            R0 = rots[inl].mean(weights=wts[inl])
+        lever = cents - pivot
+        trans = (trans + scale * (rots.apply(lever) - R0.apply(lever)))[inl]
+        print(f"[hands] {side}: one rotation world -> reference camera; the PnPs turn {np.median(ang):.0f} deg "
+              f"(median, p90 {np.percentile(ang, 90):.0f}) about it, {int((~inl).sum())} beyond "
+              f"{max(20.0, 2 * np.median(ang)):.0f} deg dropped")
+        frames, wts = frames[inl], wts[inl]
+        rots = Rotation.concatenate([R0] * len(frames))
 
     def smooth(keep):
         """Gaussian-weighted means over time of the kept placements, at every placed frame."""
@@ -348,8 +374,12 @@ def smooth_placement(world, uv, ok, depth, mask_dt, cam_R, cam_t, K, scale, G_in
       * WiLoR's 2D joints (uv (T, 21, 2), ok (T, 21)), robust loss: a bad frame weighs little instead of being cut;
       * the hand inside its glove's mask (mask_dt (T, h, w): px to the mask at half resolution, 0 inside): the frames
         WiLoR misses (the hand grasping, hidden) are still held where the glove is;
-      * the hand's depth against the depth under it (depth (T,), under WiLoR's joints, else under the glove's mask);
+      * the hand's depth against the depth under it (depth (T,), under WiLoR's joints, else under the glove's mask), or
+        with --hand-depth pnp against the per-frame placement's own (the hand's measured size: the depth under a black
+        glove is off, pick_up_hammer/095958: 122 cm at the grasp where its size puts it at 86);
       * smoothness of the knots;
+      * with --rotation drift, the knots' rotation pulled back to 0 (--rotation-prior): `G_init` holds one rotation
+        for the clip, and the correction turns it only where the 2D joints keep asking for it;
     and a constant offset of the mocap's wrist in the hand's frame (the glove's wrist joint is not WiLoR's), a nuisance
     of the 2D term only: the written hand is the mocap's."""
     from scipy.sparse import lil_matrix
@@ -369,10 +399,14 @@ def smooth_placement(world, uv, ok, depth, mask_dt, cam_R, cam_t, K, scale, G_in
     H = np.stack([v / np.linalg.norm(v, axis=1, keepdims=True).clip(1e-9) for v in (a, b, c)], 2)        # (T, 3, 3)
     MASK_JOINTS = [0, 5, 9, 13, 17, 4, 8, 12, 16, 20]
     has_mask = mask_dt is not None
+    if args.hand_depth == "pnp":
+        p_init = np.einsum("tij,tkj->tki", G_init[:, :3, :3], world) + G_init[:, None, :3, 3]
+        depth = np.median(np.einsum("tij,tkj->tki", cam_R, p_init)[..., 2] + cam_t[:, None, 2], 1)
     depth = smooth_depth(depth)
     has_depth = np.isfinite(depth)
     wm, wd = args.mask_weight, args.depth_weight
     ws_r, ws_t = args.knot_smooth * 50.0, args.knot_smooth * args.depth_weight     # px per rad, px per metre
+    prior = args.rotation_prior if args.rotation == "drift" else 0.0
 
     def hand(x, wrist_offset):
         d = W @ x[: 6 * n_knots].reshape(n_knots, 6)
@@ -396,6 +430,8 @@ def smooth_placement(world, uv, ok, depth, mask_dt, cam_R, cam_t, K, scale, G_in
         P = x[: 6 * n_knots].reshape(n_knots, 6)
         dP = np.diff(P, axis=0)
         out.append(np.c_[dP[:, :3] * ws_r, dP[:, 3:] * ws_t].ravel())
+        if prior:
+            out.append((P[:, :3] * prior).ravel())
         return np.concatenate(out)
 
     # which parameters each residual depends on (each frame on its two knots, the 2D term on the wrist offset)
@@ -405,7 +441,7 @@ def smooth_placement(world, uv, ok, depth, mask_dt, cam_R, cam_t, K, scale, G_in
         ks = np.flatnonzero(W[t] > 0)
         rows.append(np.concatenate([np.arange(6 * k, 6 * k + 6) for k in ks]))
     blocks = [(21 * 2, True)] + ([(len(MASK_JOINTS), False)] if has_mask else []) + [(1, False)]
-    S = lil_matrix((sum(b for b, _ in blocks) * n + (n_knots - 1) * 6, n_par), dtype=int)
+    S = lil_matrix((sum(b for b, _ in blocks) * n + (n_knots - 1) * 6 + (3 * n_knots if prior else 0), n_par), dtype=int)
     r0 = 0
     for size, offset in blocks:
         for t in range(n):
@@ -417,6 +453,11 @@ def smooth_placement(world, uv, ok, depth, mask_dt, cam_R, cam_t, K, scale, G_in
     for k in range(n_knots - 1):
         for i in range(6):
             S[r0 + 6 * k + i, [6 * k + i, 6 * (k + 1) + i]] = 1
+    if prior:
+        r0 += (n_knots - 1) * 6
+        for k in range(n_knots):
+            for i in range(3):
+                S[r0 + 3 * k + i, 6 * k + i] = 1
     x = least_squares(residual, np.zeros(n_par), jac_sparsity=S.tocsr(), loss="soft_l1", f_scale=10.0,
                       x_scale="jac", max_nfev=200).x
     d = W @ x[: 6 * n_knots].reshape(n_knots, 6)
