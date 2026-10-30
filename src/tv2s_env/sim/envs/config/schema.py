@@ -110,6 +110,12 @@ class RlReconEnvArgs(BaseModel):
     action_scale_pos: float = 0.03
     action_scale_rot: float = 0.25
     action_scale_finger: float = 0.4
+    # residual=False: no reference under the action (DexTaG's ARM_REL_HAND_ABS): the base / arm joints move by
+    # action x scale from their current position (action_scale_pos/rot; the arm: abs_arm_scale rad), the fingers
+    # aim at absolute targets over their limits, smoothed abs_finger_ema x target + (1 - ema) x current
+    residual: bool = True
+    abs_arm_scale: float = 0.025
+    abs_finger_ema: float = 0.2
     # tactile reward
     tac_reach_weight: float = 0.5              # r_tactile = (1 - w) soft F1 + w reach shaping
     tac_reach_scale: float = 0.02

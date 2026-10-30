@@ -744,6 +744,30 @@ class RlReconEnv(BaseEnv):
         self.action_rate = ((action - self.last_action) ** 2).mean(-1).clamp(max=1.0)
         self.last_action = action.clone()
         t1 = self.t + 1
+        if not self._args.residual:
+            self._apply_absolute(action)
+        else:
+            self._apply_residual(action, t1)
+        if self.assist_scale > 0 and not self._eval_mode:
+            self._assist()
+        self.scene.step()
+        self.t += 1
+        self.update_buffers()
+
+    def _apply_absolute(self, action: torch.Tensor) -> None:
+        """DexTaG's ARM_REL_HAND_ABS control, no reference: base / arm joints = current + action x scale, fingers =
+        abs_finger_ema x (their limits mapped from [-1, 1]) + (1 - abs_finger_ema) x current."""
+        a, nb = self._args, self.n_base
+        act = action.reshape(self._num_envs, self.H, nb + 20)
+        scale = torch.tensor([a.abs_arm_scale] * nb if a.arm.enabled else [a.action_scale_pos] * 3 + [a.action_scale_rot] * 3,
+                             device=self.device)
+        for h, hand in enumerate(self.hands):
+            q = hand.entity.get_dofs_position(hand.all_dofs)
+            fingers = hand.q_low + (act[:, h, nb:] + 1) / 2 * (hand.q_high - hand.q_low)
+            fingers = a.abs_finger_ema * fingers + (1 - a.abs_finger_ema) * q[:, nb:]
+            hand.control(torch.cat([q[:, :nb] + act[:, h, :nb] * scale, fingers], -1))
+
+    def _apply_residual(self, action: torch.Tensor, t1: torch.Tensor) -> None:
         ref = torch.cat([self.ref_at(self.base_key, t1), self.ref_at("qpos", t1)], -1)       # (B, H, n_base + 20)
         delta = (action * self.action_scale).reshape(self._num_envs, self.H, self.n_base + 20)
         arm_dq = self.ref_at("arm_dq", t1) if self._args.arm.enabled else None
@@ -752,11 +776,6 @@ class RlReconEnv(BaseEnv):
                 hand.control(ref[:, h] + delta[:, h])
             else:
                 hand.control(ref[:, h] + delta[:, h], arm_dq[:, h])
-        if self.assist_scale > 0 and not self._eval_mode:
-            self._assist()
-        self.scene.step()
-        self.t += 1
-        self.update_buffers()
 
     def _assist(self) -> None:
         """rl_recon's hand-anchored virtual object controller (ReconEnv._assist): while a simulated hand holds an
