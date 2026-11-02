@@ -820,6 +820,9 @@ class RlReconEnv(BaseEnv):
     def get_terminated(self) -> torch.Tensor:
         a, m = self._args, self._metrics
         bad = ~torch.isfinite(self.all_object_pos).all(-1).all(-1) | ~torch.isfinite(self.base_pos).all(-1).all(-1)
+        # Genesis' per-env error flags (a non-finite contact, ...): raised for the whole batch at a later step unless
+        # the env is reset first, so they end the episode as a blow-up does
+        bad = bad | self.scene.sim.rigid_solver.get_error_envs_mask().to(bad.device).reshape(-1)
         drift = ((m["e_wrist_h"] > a.term_wrist) | (m["e_kp_h"] > a.term_kp)).any(-1) | (m["e_obj_task"] > a.term_obj).any(-1)
         terminated = bad if self.disable_termination else (drift | bad)
         self._extra_info["termination"] = dict(terminated=terminated, drift=drift, error=bad)
@@ -902,6 +905,8 @@ class RlReconEnv(BaseEnv):
                 k = torch.randint(0, len(self.rsi_frames_t), (n,), device=dev, generator=gen)
                 start = torch.where(in_hand, self.rsi_frames_t[k], start)
         self._reset_hands_and_objects(envs_idx, start, in_hand)
+        from genesis.engine.solvers.rigid.abd.misc import kernel_set_zero
+        kernel_set_zero(self.scene._sanitize_envs_idx(envs_idx), self.scene.sim.rigid_solver._errno)   # get_terminated
         self.t[envs_idx], self.start[envs_idx] = start, start
         horizon = torch.full_like(start, self.T - 1)
         if not self._eval_mode and a.train_start == "random" and a.episode_window_s > 0:
