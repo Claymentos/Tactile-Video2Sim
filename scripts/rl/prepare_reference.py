@@ -144,9 +144,16 @@ def main() -> None:
     ap.add_argument("--object-trajectory", choices=("keyframes", "tracked"), default="keyframes",
                     help="keyframes: the object at rest on its reliable frames and moving with the palm while the glove "
                     "holds it (keyframe_object_trajectory); tracked: the reconstruction's CoTracker + Kalman trajectory")
-    ap.add_argument("--anchor", choices=("vision", "tactile"), default="vision",
+    ap.add_argument("--anchor", choices=("vision", "tactile", "rest", "contact"), default="vision",
                     help="keyframes: the held object's offset in the palm from its reliable frames (vision, else the "
-                    "tactile grasp pose) or from the tactile grasp pose")
+                    "tactile grasp pose) or from the tactile grasp pose, both blended at the grasp; or, without a "
+                    "jump, the offset the resting object has at the first touch: rest (its video pose), contact (that "
+                    "pose moved and scaled along the camera ray so that the active taxels lie on it)")
+    ap.add_argument("--object-poses", choices=("cotracker", "foundationpose"), default="cotracker",
+                    help="the object's tracked poses: CoTracker's points (Kabsch), or FoundationPose's "
+                    "(reconstruct.sh OBJECT_TRACKER=foundationpose)")
+    ap.add_argument("--min-iou", type=float, default=0.5,
+                    help="--object-poses foundationpose: a reliable frame's silhouette IoU with the SAM3 mask")
     ap.add_argument("--object-target", choices=("dense", "measured"), default="dense",
                     help="keyframes: how the RL scores the object: alike on every frame (dense), or strictly where its "
                     "pose is measured (at rest, the reliable frames of a hold seen in the video) and loosely while it is "
@@ -191,7 +198,7 @@ def main() -> None:
         subprocess.run(cmd, check=True)
     print("2/6 reference (world frame)")
     path = build_reference(recon, episode, obj, side, wuji_ref, out, hand_table_clearance=args.hand_table_clearance,
-                           clearance_mode=args.clearance_mode)
+                           clearance_mode=args.clearance_mode, tracker=args.object_poses)
     print("3/6 object axis per frame from the SAM3 masks")
     add_mask_axes(path, recon, obj)
     print("4/6 in-hand object pose that best explains the glove")
@@ -200,8 +207,10 @@ def main() -> None:
     select_grasp_pose(path)
     if args.object_trajectory == "keyframes":
         print("6/6 the object's trajectory: at rest from its reliable frames, held with the palm")
+        fp = args.object_poses == "foundationpose"
         keyframe_object_trajectory(path, recon, obj, episode, anchor=args.anchor, target=args.object_target,
-                                   held_weight=args.held_weight, held_margin=args.held_margin)
+                                   held_weight=args.held_weight, held_margin=args.held_margin, tracker=args.object_poses,
+                                   **(dict(min_inliers=int(round(100 * args.min_iou))) if fp else {}))
 
     r = load_reference(path)
     print(f"-> {path}: {len(r['qpos'][0])} frames at {r['fps']:g} Hz, hands {r['sides']}, {len(r['holds'])} holds "

@@ -41,6 +41,7 @@ PY_MOGE="${PY_MOGE:-$CONDA_BASE/envs/moge/bin/python}"                 # MoGe me
 PY_DA3="${PY_DA3:-$HOME/venvs/da3/bin/python}"                         # Depth-Anything-3 depth (reconstruct.sh DEPTH=da3): a venv over the moge env, ~/Depth-Anything-3 installed
 PY_RECGEN="${PY_RECGEN:-$CONDA_BASE/envs/recgen/bin/python}"           # RecGen meshes
 PY_HAWOR="${PY_HAWOR:-$CONDA_BASE/envs/hawor/bin/python}"              # HaWoR hands from the video (reconstruct.sh HANDS=hawor)
+PY_FP="${PY_FP:-$CONDA_BASE/envs/foundationpose/bin/python}"            # FoundationPose (reconstruct.sh OBJECT_TRACKER=foundationpose), FP_ROOT=~/FoundationPose
 export HAWOR_DIR="${HAWOR_DIR:-$HOME/do-as-i-do/reconstruction/modules/HaWoR}"   # HaWoR checkout
 export RECGEN_DIR="${RECGEN_DIR:-$HOME/recgen}"                          # RecGen checkout
 RECGEN_CHECKPOINT="${RECGEN_CHECKPOINT:-recgen_base.multiview_stereo}"    # RecGen model (reconstruct.sh)

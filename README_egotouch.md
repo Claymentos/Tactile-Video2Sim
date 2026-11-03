@@ -578,8 +578,55 @@ python scripts/data/dextag_to_reference.py \
     --pkl ~/DexTaG/data/dextag_trajectories/hammer_mixed/pickles_filtered/20260201_165843_353314.pkl \
     --out data/references/dextag_hammer_165843
 python scripts/reconstruction/replay_raw_genesis.py --reference data/references/dextag_hammer_165843/reference.npz
-TV2S_WANDB=1 SKIP_SCENE=1 SKIP_RECON=1 SKIP_REFERENCE=1 TRAIN_ARGS="--env.arm.enabled=True" \
+TV2S_WANDB=1 SKIP_SCENE=1 SKIP_RECON=1 SKIP_REFERENCE=1 \
+    REFERENCE=data/references/dextag_hammer_165843/reference.npz TRAIN_ARGS="--env.arm.enabled=True" \
     launch/rl_recon.sh dextag_hammer_165843_arm dextag
+```
+
+### 8.6 Trajectoire de l'objet : sans saut, FoundationPose, ancrage au contact (02/11/2026)
+
+**Problème.** Dans la référence, le marteau saute dans la main à la saisie : la pose au repos (vision) et la pose en main (paume × pose de prise tactile) diffèrent de 2,9 cm et 86°, raccordées par un fondu de 6 frames (14° par frame).
+
+**Options ajoutées.**
+- `prepare_reference.py --anchor rest` : le décalage dans la paume est celui de l'objet au repos au début de la prise franche ; plus de fondu. Au lâcher, l'objet est reposé sur la table en 3 frames.
+- `prepare_reference.py --anchor contact` :
+  - l'objet est d'abord posé à plat sur la table : la pose stable la plus proche de celle de la vidéo, à la distance où le rayon caméra rencontre la table (`solve_contact_pose`) ;
+  - la main est ensuite décalée au début de la prise franche (≥ 5 canaux) pour que ses taxels actifs touchent l'objet (`solve_hand_shift`), et ce décalage est gardé jusqu'à la prise suivante ;
+  - la marge main–table (`--hand-table-clearance`, mode frame) est réappliquée après ;
+  - relancer l'étape repart toujours de la main et des meshes non décalés.
+- `reconstruct.sh OBJECT_TRACKER=foundationpose` (étape 8b, env `PY_FP`, `FP_ROOT=~/FoundationPose`) : `track_object_foundationpose.py` suit le mesh RecGen sur l'image et la profondeur. Il part de la pose du mesh à la frame de référence, et se réinitialise sur le masque SAM3 quand l'IoU de la silhouette passe sous 0,3. Il écrit `<objet>_traj_foundationpose.npz`, à côté de la trajectoire CoTracker, ainsi qu'une vidéo de contrôle. `prepare_reference.py --object-poses foundationpose` l'utilise : une frame est fiable si l'IoU ≥ `--min-iou` (0,5).
+
+**Résultats sur `pick_up_hammer/095958`.** Une seule reconstruction (DA3 + contact), puis cinq références :
+
+| référence | saut à la saisie | taxels actifs → objet : au contact / pendant la tenue | objet au repos (z) | mesh | rejeu physique sans policy : levée |
+|---|---|---|---|---|---|
+| base (`--anchor vision`) | 14°/frame | 3,9 / 1,0 cm | −8,4 cm | 39 cm | 0 cm |
+| A `--anchor rest` | 3°/frame | 13,0 / 16,0 cm | −8,4 cm | 39 cm | 0 cm |
+| B `--object-poses foundationpose` | 21°/frame | 7,3 / 0,9 cm | −5,8 cm | 39 cm | 0 cm |
+| C `--anchor contact` | 6°/frame | 6,7 / 5,6 cm | 0 | 38 cm | **4,9 cm** |
+| B + C | 6°/frame | 6,7 / 5,3 cm | 0 | 38 cm | 0,8 cm |
+
+(La levée de référence est d'environ 52 cm. Pour la base, l'écart pendant la tenue est faible parce que la pose tactile est ajustée sur les taxels.)
+
+**Constats.**
+- **A** supprime le saut, mais l'objet est tenu à 13–16 cm de la main.
+- **B**, FoundationPose, suit nettement mieux l'objet dans l'image : 93 % des frames à IoU ≥ 0,5, balancement compris grâce à 4 réinitialisations, contre 295/397 frames fiables pour CoTracker. Mais les décalages paume → objet pendant la tenue restent dispersés (88° / 5,6 cm) : la limite est le placement de la main, pas le suivi de l'objet.
+- **C** :
+  - le marteau est à plat sur la table et le saut disparaît ;
+  - la main descendue de 6 cm pour toucher l'objet est remontée d'autant par la marge main–table : à la prise franche, les taxels actifs sont plus hauts que le marteau couché, alors que le point le plus bas de la main est déjà au ras de la table ;
+  - la forme de la main reciblée et le mesh ne sont donc pas compatibles à cette frame ;
+  - c'est la seule variante où la main seule soulève un peu le marteau en physique.
+- **Le premier contact léger n'est pas fiable.** Sur ce clip, 2 canaux s'activent à la frame 37, avec la main encore à 6,5 cm au-dessus de la table : s'y ancrer enfonçait la main de 7 cm dans la table pendant toute la prise.
+- **Pas de correction de hauteur au lâcher.** Elle enfonçait la main de 8 cm : l'écart au lâcher vient de la dérive d'orientation de la paume, pas de sa hauteur.
+
+```bash
+KEY=pick_up_hammer__20260321_095958_211
+SKIP_FRAMES=1 SKIP_SAM3=1 SKIP_DEPTH=1 SKIP_CAMERA=1 SKIP_MOCAP=1 SKIP_MESH=1 SKIP_OBJECT=1 OBJECT_TRACKER=foundationpose \
+DEPTH=da3 HAND_CONTACT=1 HANDS=mocap HAND_SIDES="left right" HAND_PLACEMENT=smooth HAND_POSE_SMOOTH=4 HAND_DEPTH=moge \
+HAND_KNOT_FRAMES=10 launch/reconstruct.sh $KEY data/egotouch/recon/$KEY       # étape 8b seule (+ 9)
+python scripts/rl/prepare_reference.py --recon data/egotouch/recon/$KEY --scene data/egotouch/scene/$KEY.json \
+    --out data/references/test_contact --clearance-mode frame --hand-table-clearance 0.008 \
+    --object-trajectory keyframes --object-target dense --anchor contact [--object-poses foundationpose] --overwrite
 ```
 
 ## Jean Zay (SLURM)

@@ -89,9 +89,20 @@ def object_long_axis(V: np.ndarray) -> np.ndarray:
     return axis if (V @ axis).max() > -(V @ axis).min() else -axis
 
 
+def clearance_lift(human_kp: np.ndarray, valid: np.ndarray, clearance: float, mode: str) -> np.ndarray:
+    """The hand's lift (T,) so that its lowest GT joint clears the table by `clearance`: one for the clip (global), or
+    each frame's need spread over +-15 frames and smoothed (frame)."""
+    lowest = human_kp[..., 2].min(1)
+    if mode == "global":
+        return np.full(len(lowest), max(0.0, clearance - lowest[valid].min()))
+    from scipy.ndimage import gaussian_filter1d, maximum_filter1d
+    need = np.where(valid, np.maximum(0.0, clearance - lowest), 0.0)
+    return np.maximum(gaussian_filter1d(maximum_filter1d(need, size=31, mode="nearest"), 5.0, mode="nearest"), need)
+
+
 def build_reference(recon: Path, episode: Path, obj: str, side: str, wuji_ref: Path, out_dir: Path,
                     collision_faces: int = 4000, contact_threshold: float = 5.0, hand_table_clearance: float = 0.008,
-                    clearance_mode: str = "global") -> Path:
+                    clearance_mode: str = "global", tracker: str = "cotracker") -> Path:
     """<out_dir>/reference.npz and the object meshes (module docstring). clearance_mode "frame": each frame lifted by
     what it needs, spread over +-15 frames and smoothed, instead of one lift for the whole clip."""
     recon, out_dir = Path(recon), Path(out_dir)
@@ -105,9 +116,11 @@ def build_reference(recon: Path, episode: Path, obj: str, side: str, wuji_ref: P
     local = mesh.copy()
     local.vertices = (np.asarray(mesh.vertices) - centre) @ C.T
     local.export(out_dir / "object_visual.obj")
+    for stale in out_dir.glob("object_*_unscaled.obj"):         # a previous --anchor contact's: these meshes are new
+        stale.unlink()
     coll = local.simplify_quadric_decimation(face_count=collision_faces) if len(local.faces) > collision_faces else local
     coll.export(out_dir / "object_collision.obj")
-    track = np.load(recon / f"{obj}_traj_cotracker.npz")
+    track = np.load(recon / f"{obj}_traj_{tracker}.npz")
     Rt, tt = track["rotation"], track["translation"]
     obj_rot = np.einsum("ij,tjk,lk->til", C, Rt, C)
     obj_pos = to_w(np.einsum("tij,j->ti", Rt, centre) + tt)
@@ -142,13 +155,7 @@ def build_reference(recon: Path, episode: Path, obj: str, side: str, wuji_ref: P
     # hand-table consistency: lift the hand (never the object or the table) so that its lowest joint clears the table
     hand_dz = np.zeros(len(human_kp))
     if hand_table_clearance >= 0:
-        lowest = human_kp[..., 2].min(1)
-        if clearance_mode == "global":
-            hand_dz[:] = max(0.0, hand_table_clearance - lowest[hand_valid].min())
-        else:
-            from scipy.ndimage import gaussian_filter1d, maximum_filter1d
-            need = np.where(hand_valid, np.maximum(0.0, hand_table_clearance - lowest), 0.0)
-            hand_dz = np.maximum(gaussian_filter1d(maximum_filter1d(need, size=31, mode="nearest"), 5.0, mode="nearest"), need)
+        hand_dz = clearance_lift(human_kp, hand_valid, hand_table_clearance, clearance_mode)
         wrist_pos = wrist_pos + hand_dz[:, None] * np.r_[0, 0, 1]
         human_kp = human_kp + hand_dz[:, None, None] * np.r_[0, 0, 1]
         base_q = base_coordinates(R0, wrist_pos, wrist_rot)
@@ -367,19 +374,23 @@ def add_grasp_pose(reference: Path, min_contacts: int = 5, radius: float = 0.004
     np.savez(reference, **ref)
 
 
-def measure_object_poses(ref: dict, recon: Path, obj: str, episode: Path, min_visible: int = 40):
+def measure_object_poses(ref: dict, recon: Path, obj: str, episode: Path, min_visible: int = 40,
+                         tracker: str = "cotracker"):
     """The object's pose in each frame, solved again (Kabsch + RANSAC on CoTracker's lifted points, no smoothing) from
     the points off both gloves' masks (EgoTouch masks.npz): CoTracker's points slide onto the glove that hides the
     object and stay on it, and a frame is then pulled towards the hand. Frames with fewer than `min_visible` such
     points keep the composed (Kalman) trajectory and 0 inliers. Returns world (pos (T, 3), rot (T, 3, 3)), the RANSAC
     inliers (T,), the points off the gloves (T,) and the fraction of the visible points on a glove (T,; NaN where none
-    is visible)."""
+    is visible). tracker "foundationpose": FoundationPose's poses as they are (track_object_foundationpose.py), the
+    "inliers" 100 x the IoU of the mesh's silhouette with the SAM3 mask off the gloves."""
     T = len(ref["qpos"])
     C, shift, centre = ref["C"], ref["shift"], ref["obj_centre_cam"]
-    comp = np.load(recon / f"{obj}_traj_composed_cotracker.npz")
+    comp = np.load(recon / f"{obj}_traj_composed_{tracker}.npz")
     Rt, tt = comp["rotation"][:T], comp["translation"][:T]
     rot_w = np.einsum("ij,tjk,lk->til", C, Rt, C)
     pos_w = (np.einsum("tij,j->ti", Rt, centre) + tt) @ C.T + shift
+    if tracker == "foundationpose":
+        return pos_w, rot_w, comp["inliers"][:T].astype(int), np.full(T, -1), np.full(T, np.nan)
     # each frame's pose solved again from the points off the gloves: CoTracker's points slide onto the glove that
     # hides the object and stay on it, and a frame is then pulled towards the hand
     from tv2s_data.rigid_poses import kabsch_ransac
@@ -413,6 +424,19 @@ def measure_object_poses(ref: dict, recon: Path, obj: str, episode: Path, min_vi
     return pos_w, rot_w, inl, off.sum(1), np.where(n_vis > 0, 1 - off.sum(1) / np.maximum(n_vis, 1), np.nan)
 
 
+def robust_mean(R: np.ndarray, p: np.ndarray):
+    """Rotation mean and median translation of the poses within 2 x the median angle of the first mean, and their
+    spread (deg, m)."""
+    rots = Rotation.from_matrix(R)
+    m = rots.mean()
+    ang = np.degrees((m.inv() * rots).magnitude())
+    keep = ang <= max(10.0, 2 * np.median(ang))
+    m = rots[keep].mean()
+    p0 = np.median(p[keep], 0)
+    spread = (np.median(np.degrees((m.inv() * rots[keep]).magnitude())), np.median(np.linalg.norm(p[keep] - p0, axis=1)))
+    return m.as_matrix(), p0, spread
+
+
 def consistent_keyframes(pos: np.ndarray, rot: np.ndarray, reliable: np.ndarray, window: int = 3, min_neighbours: int = 2,
                          max_cm: float = 2.0, max_deg: float = 10.0) -> np.ndarray:
     """The reliable frames that agree with their reliable neighbours within +-`window` frames: within `max_cm` of
@@ -430,10 +454,241 @@ def consistent_keyframes(pos: np.ndarray, rot: np.ndarray, reliable: np.ndarray,
     return kf
 
 
+def hand_points_world(ref: dict, frames: np.ndarray, hulls: int = 12):
+    """The Wuji taxels (F, N, 3) with their glove channel (N,), and points on the hand's collision hulls (F, M, 3), in
+    the world at the reference hand of `frames`."""
+    tax = np.load(str(ref["taxels"]), allow_pickle=True)
+    hand = WujiHand(str(ref["side"]))
+    T = hand.fk(ref["qpos"][frames])
+    P = np.stack([np.einsum("fij,j->fi", T[l][:, :3, :3], p) + T[l][:, :3, 3]
+                  for l, p in zip([str(l) for l in tax["link"]], tax["pos"])], 1)
+    surf = []
+    for link in hand.movable_links():
+        for h in hand.collision_hulls(link) or []:
+            surf.append(np.einsum("fij,nj->fni", T[link][:, :3, :3], h.sample(hulls)) + T[link][:, None, :3, 3])
+    S = np.concatenate(surf, 1)
+    Rw, pw = ref["wrist_rot"][frames], ref["wrist_pos"][frames]                  # palm -> world
+    to_w = lambda X: np.einsum("fij,fnj->fni", Rw, X) + pw[:, None]
+    return to_w(P), np.asarray(tax["channel"]), to_w(S)
+
+
+def solve_contact_pose(ref: dict, frames: np.ndarray, R0: np.ndarray, p0: np.ndarray, mesh_path: Path,
+                       fit_scale: bool = True, max_shift: float = 0.02,
+                       max_turn_deg: float = 10.0, snap_rest: bool = True, w_contact: float = 1.0,
+                       device: str = "cuda") -> dict:
+    """The resting object's pose (and its size) that puts the glove's active taxels on its surface at `frames`, the
+    firm grasp's onset and its neighbours.
+
+    The video places the object well across the camera ray (its mask) and badly along it (the monocular depth):
+    an object L long at distance d projects as one mu L long at mu d. So the unknowns are mu, the object and its
+    mesh scaled about the camera centre (c + mu (p - c), the vertices x mu: the projection is unchanged), a shift
+    across the ray (max_shift scale) and a small turn (max_turn_deg scale); the residuals: the active taxels on the
+    surface (0.5 cm), no hand point inside the object (0.3 cm), the object's lowest point on the table (z = 0, 0.5
+    cm), the shift and the turn. fit_scale False: mu held at 1 (a later grasp of the same, already scaled, object).
+    snap_rest: the video's orientation first replaced by the nearest stable pose of the mesh on the table (turned about
+    the vertical to match it): a resting object lies flat. w_contact 0: the object only laid on the table where the
+    camera sees it (the hand then comes to it: solve_hand_shift)."""
+    import torch
+    from scipy.optimize import least_squares
+
+    from tv2s_env.tactile.mesh_sdf import MeshDistance
+
+    P, channel, S = hand_points_world(ref, frames)
+    on = (ref["real_contact"][frames] > 0)[:, channel]                           # (F, N) taxels of firing channels
+    sdf = MeshDistance(str(mesh_path), torch.device(device), voxel=0.001, signed=True)
+    V = np.asarray(trimesh.load(str(mesh_path), force="mesh", process=False).vertices)
+    c = ref["cam_pos"][frames].mean(0)
+    ray = p0 - c
+    ray /= np.linalg.norm(ray)
+    u = np.cross(ray, [0.0, 0.0, 1.0])
+    u /= np.linalg.norm(u)
+    v = np.cross(ray, u)
+    Pc, Sn = P[on], S.reshape(-1, 3)
+    dist = lambda X, R, p, mu: mu * sdf(torch.as_tensor(((X - p) @ R) / mu, dtype=torch.float32, device=device)).cpu().numpy()
+
+    def pose(x):
+        mu = np.exp(x[0]) if fit_scale else 1.0
+        R = Rotation.from_rotvec(x[3:6]).as_matrix() @ R0
+        return R, c + mu * (p0 - c) + x[1] * u + x[2] * v, mu
+
+    def residual(x):
+        R, p, mu = pose(x)
+        r_contact = w_contact * dist(Pc, R, p, mu) / 0.005
+        r_pen = np.minimum(dist(Sn, R, p, mu), 0.0) / 0.003
+        r_table = [((mu * V) @ R.T + p)[:, 2].min() / 0.005]
+        prior = np.r_[x[1:3] / max_shift, np.degrees(np.linalg.norm(x[3:6])) / max_turn_deg]
+        return np.concatenate([r_contact, r_pen, r_table, prior])
+
+    snap, gap_video = 0.0, float(np.median(np.abs(dist(Pc, R0, p0, 1.0))))
+    if snap_rest:
+        # the video's rest pose is tilted (the hammer 12 cm tall, half under the table): the nearest of the mesh's
+        # stable poses on a plane, turned about the vertical to match the video's
+        mesh = trimesh.load(str(mesh_path), force="mesh", process=False)
+        best = (np.inf, R0)
+        for Ts in trimesh.poses.compute_stable_poses(mesh, n_samples=1)[0][:8]:
+            Rs = Ts[:3, :3]
+            M = R0 @ Rs.T
+            yaw = np.arctan2(M[1, 0] - M[0, 1], M[0, 0] + M[1, 1])
+            Rc = Rotation.from_euler("z", yaw).as_matrix() @ Rs
+            ang = np.degrees(Rotation.from_matrix(Rc @ R0.T).magnitude())
+            if ang < best[0]:
+                best = (ang, Rc)
+        snap, R0 = best
+    sol = least_squares(residual, np.zeros(6), loss="soft_l1", f_scale=1.0, x_scale=[0.2, 0.02, 0.02, 0.1, 0.1, 0.1])
+    R, p, mu = pose(sol.x)
+    d_before, d_after = dist(Pc, R0, p0, 1.0), dist(Pc, R, p, mu)
+    return dict(R=R, p=p, mu=mu, n_taxels=int(on.sum()), snap_deg=float(snap), gap_video=gap_video, shift=float(np.linalg.norm(sol.x[1:3])),
+                turn_deg=float(np.degrees(np.linalg.norm(sol.x[3:6]))),
+                gap_before=float(np.median(np.abs(d_before))), gap_after=float(np.median(np.abs(d_after))),
+                pen_after=float(-np.minimum(dist(Sn, R, p, mu), 0).max()),
+                table_after=float(((mu * V) @ R.T + p)[:, 2].min()))
+
+
+def mesh_path_scaled(mesh_path: Path, mu: float) -> Path:
+    """mesh_path's mesh mu times its size, next to it (the hand is solved against the object at its new size)."""
+    if abs(mu - 1) < 1e-6:
+        return mesh_path
+    out = mesh_path.with_name(mesh_path.stem + "_mu.obj")
+    m = trimesh.load(str(mesh_path), force="mesh", process=False)
+    m.vertices = np.asarray(m.vertices) * mu
+    m.export(out)
+    return out
+
+
+def solve_hand_shift(ref: dict, frames: np.ndarray, R: np.ndarray, p: np.ndarray, mesh_path: Path,
+                     max_horizontal: float = 0.03, device: str = "cuda") -> dict:
+    """The translation of the reference hand that puts its active taxels on the object (R, p) at `frames` (a first
+    touch), no hand point inside it: the hand's height above the table drifts over a clip (the glove's drift, the
+    camera's), and a touch says where the hand was. Horizontally it is held near 0 (max_horizontal scale)."""
+    import torch
+    from scipy.optimize import least_squares
+
+    from tv2s_env.tactile.mesh_sdf import MeshDistance
+
+    P, channel, S = hand_points_world(ref, frames)
+    on = (ref["real_contact"][frames] > 0)[:, channel]
+    sdf = MeshDistance(str(mesh_path), torch.device(device), voxel=0.001, signed=True)
+    Pc, Sn = P[on], S.reshape(-1, 3)
+    dist = lambda X: sdf(torch.as_tensor((X - p) @ R, dtype=torch.float32, device=device)).cpu().numpy()
+
+    def residual(x):
+        return np.concatenate([dist(Pc + x) / 0.005, np.minimum(dist(Sn + x), 0.0) / 0.003, x[:2] / max_horizontal])
+
+    sol = least_squares(residual, np.zeros(3), loss="soft_l1", f_scale=1.0, x_scale=0.02)
+    return dict(shift=sol.x, gap_before=float(np.median(np.abs(dist(Pc)))), gap_after=float(np.median(np.abs(dist(Pc + sol.x)))),
+                pen_after=float(-np.minimum(dist(Sn + sol.x), 0).max()))
+
+
+def anchored_object_trajectory(ref: dict, pos_w: np.ndarray, rot_w: np.ndarray, reliable: np.ndarray, holds: list,
+                               mesh_path: Path, anchor: str, touch_contacts: int = 5, rest_frames: int = 15,
+                               release_blend: int = 3, hand_fix: bool = True):
+    """The object at rest, then in the palm from the first touch of each grasp, without a jump: the offset in the palm
+    is the one the resting object has at that touch (palm(t_g)^-1 x rest pose), so that the held object starts where
+    it rests and the blend is gone.
+      anchor "rest"     the rest pose is the video's (the robust mean of the reliable poses away from the hand);
+      anchor "contact"  that pose moved and scaled so that the active taxels lie on its surface (solve_contact_pose):
+                        the hand's metric pose places the object, the video only across the camera ray.
+    The release: the object put down where the palm leaves it (palm(t_r) x offset), lowered onto the table over
+    release_blend frames.
+    hand_fix (anchor "contact"): the object is laid flat on the table where the camera sees it, and the hand comes to
+    it instead: at the firm grasp's onset, the hand's shift that puts its active taxels on the object
+    (solve_hand_shift), kept until the next grasp. Not at the release: shifting the hand there so that the released
+    object meets the table pushed it 8 cm into the table (the object's offset at the release is off by the palm's
+    orientation drift over the hold, ~10 deg x a 30 cm lever, not by the hand's height); the object is lowered onto
+    the table instead. The touch is the firm grasp's onset (touch_contacts >= 5
+    channels, the hold's start): on pick_up_hammer/095958 the first light touch (2 channels, frame 37) fires with the
+    hand still 6.5 cm above the table, before it reaches the hammer, and anchoring there pushed the hand 7 cm down
+    into the table for the whole grasp. Returns out_R, out_p, source, a report,
+    the contact solves, mu and the hand's shift (T, 3)."""
+    T = len(pos_w)
+    n_on = (ref["real_contact"] > 0).sum(1)
+    Rp, pp = ref["wrist_rot"], ref["wrist_pos"]
+    V = np.asarray(trimesh.load(str(mesh_path), force="mesh", process=False).vertices)
+    out_R, out_p = np.zeros((T, 3, 3)), np.zeros((T, 3))
+    source = np.array(["rest"] * T, dtype=object)
+    report, solves, knots = [], [], []
+    rest = None                                      # the pose the object rests in before the next grasp
+    start, mu = 0, 1.0
+    for k, (a, b) in enumerate(holds):
+        t_g = a
+        while t_g > start and n_on[t_g - 1] >= touch_contacts:
+            t_g -= 1
+        t_r = b - 1
+        nxt = holds[k + 1][0] if k + 1 < len(holds) else T
+        while t_r + 1 < nxt and n_on[t_r + 1] >= touch_contacts:
+            t_r += 1
+        if rest is None:                                 # before the first grasp: the video, away from the hand
+            good = np.flatnonzero(reliable[start:t_g]) + start
+            if len(good) >= 3:
+                R0, p0, _ = robust_mean(rot_w[good[:rest_frames]], pos_w[good[:rest_frames]])
+                how = f"{len(good[:rest_frames])} reliable frames"
+            else:
+                R0, p0, how = rot_w[start], pos_w[start], "the tracked first frame"
+        else:
+            (R0, p0), how = rest, "where the previous release left it"
+        s_g = np.zeros(3)
+        if anchor == "contact":
+            fr = np.arange(t_g, min(t_g + 3, T))
+            sol = solve_contact_pose(ref, fr, R0, p0, mesh_path, fit_scale=not solves, w_contact=0.0 if hand_fix else 1.0)
+            if not solves:
+                mu = sol["mu"]
+            R0, p0 = sol["R"], sol["p"]
+            msg = (f"grasp {t_g}: {sol['n_taxels']} active taxels {sol['gap_video'] * 100:.1f} cm from the video's "
+                   f"pose; the object laid flat ({sol['snap_deg']:.0f} deg), mu {sol['mu']:.2f}, shift "
+                   f"{sol['shift'] * 100:.1f} cm, turn {sol['turn_deg']:.0f} deg, lowest point z "
+                   f"{sol['table_after'] * 100:.1f} cm, taxels {sol['gap_after'] * 100:.1f} cm from it")
+            if hand_fix:
+                hs = solve_hand_shift(ref, fr, R0, p0 + 0.0, mesh_path_scaled(mesh_path, mu))
+                s_g = hs["shift"]
+                sol.update(hand_shift_grasp=s_g.tolist(), gap_hand_after=hs["gap_after"])
+                msg += (f"; the hand moved {np.round(s_g * 100, 1)} cm: taxels {hs['gap_after'] * 100:.1f} cm from it, "
+                        f"penetration {hs['pen_after'] * 100:.1f} cm")
+            solves.append(dict(sol, t_g=int(t_g), R=None, p=None))
+            report.append(msg)
+        out_R[start:t_g], out_p[start:t_g] = R0, p0
+        report.append(f"rest {start}-{t_g - 1}: {anchor} pose from {how}")
+        # held from the first touch, with the offset the resting object has there (the hand as shifted there)
+        R_off, p_off = Rp[t_g].T @ R0, Rp[t_g].T @ (p0 - pp[t_g] - s_g)
+        held_pose = lambda f, sh: (Rp[f] @ R_off, pp[f] + sh + Rp[f] @ p_off)
+        # the release: the hand shifted (vertically) so that the object it lets go rests on the table
+        Rr, pr = held_pose(t_r, s_g)
+        drop = (mu * V @ Rr.T + pr)[:, 2].min()
+        s_r = s_g          # the release says little of the hand's height: the palm's orientation drifts over the hold
+        knots += [(t_g, s_g), (t_r, s_r)]
+        fr = np.arange(t_g, t_r + 1)
+        w = ((fr - t_g) / max(t_r - t_g, 1))[:, None]
+        sh = s_g + w * (s_r - s_g)
+        out_R[fr] = np.einsum("tij,jk->tik", Rp[fr], R_off)
+        out_p[fr] = pp[fr] + sh + np.einsum("tij,j->ti", Rp[fr], p_off)
+        source[fr] = f"held ({anchor})"
+        ref["grasp_R_palm"], ref["grasp_p_palm"] = R_off, p_off
+        # released where the palm leaves it, lowered onto the table
+        Rr, pr = out_R[t_r], out_p[t_r].copy()
+        drop = (mu * V @ Rr.T + pr)[:, 2].min()
+        pr[2] -= drop
+        e = min(t_r + 1 + release_blend, T)
+        if e > t_r + 1:
+            w = np.linspace(0, 1, e - t_r)[1:, None]
+            out_R[t_r + 1:e], out_p[t_r + 1:e] = Rr, out_p[t_r] + w * (pr - out_p[t_r])
+            source[t_r + 1:e] = "released"
+        rest, start = (Rr, pr), e
+        report.append(f"held {t_g}-{t_r} (glove hold {a}-{b - 1}), released at {t_r}, {drop * 100:+.1f} cm above the table")
+    out_R[start:], out_p[start:] = (rest if rest is not None else (rot_w[0], pos_w[0]))
+    if start < T:
+        report.append(f"rest {start}-{T - 1}: where the last release left it")
+    # the hand's shift in every frame: linear between the touches, held before the first and after the last
+    hand_shift = np.zeros((T, 3))
+    if knots:
+        kt, ks = np.array([k[0] for k in knots], float), np.stack([k[1] for k in knots])
+        hand_shift = np.stack([np.interp(np.arange(T), kt, ks[:, i]) for i in range(3)], 1)
+    return out_R, out_p, source, report, solves, mu, hand_shift
+
+
 def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: Path, min_inliers: int = 30,
                                min_visible: int = 40, blend: int = 6, anchor: str = "vision",
                                max_spread_deg: float = 15.0, max_spread_cm: float = 3.0, rest_tol: float = 0.04,
-                               target: str = "dense", held_weight: float = 0.5, held_margin: float = 3.0) -> None:
+                               target: str = "dense", held_weight: float = 0.5, held_margin: float = 3.0,
+                               tracker: str = "cotracker", hand_fix: bool = True, clearance: float = 0.008) -> None:
     """The object's trajectory from its reliable frames only, and from the hand while it is held.
 
     CoTracker's object trajectory fails exactly when it matters: the grasping hand hides the object, its points slide
@@ -465,110 +720,138 @@ def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: 
     ref = dict(np.load(reference, allow_pickle=True))
     if "obj_pos_tracked" in ref:                 # run again: from the tracked trajectory, not the previous result
         ref["obj_pos"], ref["obj_rot"] = ref["obj_pos_tracked"], ref["obj_rot_tracked"]
+    if "hand_contact_shift" in ref:              # run again: the hand as build_reference left it (anchor "contact")
+        sh = ref.pop("hand_contact_shift")
+        ref["wrist_pos"] = ref["wrist_pos"] - sh
+        ref["human_kp"] = ref["human_kp"] - sh[:, None]
+        ref["ref_keypoints"] = ref["ref_keypoints"] - sh[:, None]
+        ref["hand_dz"] = ref["hand_dz"] - sh[:, 2]
+        ref["base_q"] = base_coordinates(ref["base_R0"], ref["wrist_pos"], ref["wrist_rot"])
     recon, episode = Path(recon), Path(episode)
     T = len(ref["qpos"])
-    pos_w, rot_w, inl, _, on_glove = measure_object_poses(ref, recon, obj, episode, min_visible)
+    pos_w, rot_w, inl, _, on_glove = measure_object_poses(ref, recon, obj, episode, min_visible, tracker)
     reliable = inl >= min_inliers
     kf = consistent_keyframes(pos_w, rot_w, reliable)
-    def robust_mean(R, p):
-        """Rotation mean and median translation of the poses within 2 x the median angle of the first mean."""
-        rots = Rotation.from_matrix(R)
-        m = rots.mean()
-        ang = np.degrees((m.inv() * rots).magnitude())
-        keep = ang <= max(10.0, 2 * np.median(ang))
-        m = rots[keep].mean()
-        p0 = np.median(p[keep], 0)
-        spread = (np.median(np.degrees((m.inv() * rots[keep]).magnitude())), np.median(np.linalg.norm(p[keep] - p0, axis=1)))
-        return m.as_matrix(), p0, spread
-
     side_holds = contact_holds(ref["real_contact"] > 0)
-    out_R, out_p = np.zeros((T, 3, 3)), np.zeros((T, 3))
-    source = np.array(["rest"] * T, dtype=object)
-    report, spreads, anchors = [], [], []
-    # held: the palm times one offset
-    Rp, pp = ref["wrist_rot"], ref["wrist_pos"]
-    for a, b in side_holds:
-        frames = np.arange(a, min(b, T))
-        good = frames[reliable[frames]]
-        how, spread = anchor, (np.nan, np.nan)
-        if anchor == "vision" and len(good) >= 5:
-            A_R = np.einsum("tji,tjk->tik", Rp[good], rot_w[good])                         # palm^T object
-            A_p = np.einsum("tji,tj->ti", Rp[good], pos_w[good] - pp[good])
-            R_off, p_off, spread = robust_mean(A_R, A_p)
-            spreads.append(spread)
-            if spread[0] > max_spread_deg or spread[1] * 100 > max_spread_cm:
-                how = "tactile"                  # the video's offsets disagree: not a reliable view of the held object
-        if how != "vision":
-            if "grasp_R_palm" not in ref:
-                raise SystemExit(f"hold {a}-{b}: {len(good)} reliable frames and no grasp pose (add_grasp_pose)")
-            R_off, p_off, how = ref["grasp_R_palm"], ref["grasp_p_palm"], "tactile"
-        out_R[frames] = np.einsum("tij,jk->tik", Rp[frames], R_off)
-        out_p[frames] = pp[frames] + np.einsum("tij,j->ti", Rp[frames], p_off)
-        source[frames] = f"held ({how})"
-        anchors.append((a, min(b, T), R_off, p_off))
-        seen = (f"the video's offsets on {len(good)} reliable frames spread {spread[0]:.0f} deg / {spread[1] * 100:.1f} cm"
-                if np.isfinite(spread[0]) else f"{len(good)} reliable frames")
-        report.append(f"held {a}-{b - 1}: offset from {'the video' if how == 'vision' else 'the tactile grasp pose'} ({seen})")
-    # at rest: one pose per stretch between holds
-    held = source != "rest"
-    stretches, t = [], 0
-    while t < T:
-        if not held[t]:
-            s = t
-            while t < T and not held[t]:
-                t += 1
-            stretches.append((s, t))
-        else:
-            t += 1
-    def hold_with(frames, R_off, p_off):
-        out_R[frames] = np.einsum("tij,jk->tik", Rp[frames], R_off)
-        out_p[frames] = pp[frames] + np.einsum("tij,j->ti", Rp[frames], p_off)
-        source[frames] = "held (extended)"
-
-    for s, e in stretches:
-        prev = next((h for h in anchors if h[1] == s), None)          # the hold ending where this stretch starts
-        nxt = next((h for h in anchors if h[0] == e), None)           # the hold starting where it ends
-        frames = np.arange(s, e)
-        good = frames[reliable[frames]]
-        if len(good) >= 3:
-            # the rest pose from where the object surely rests: away from the hand that brings or takes it
-            pick = good[-15:] if prev is not None and nxt is None else good[:15] if nxt is not None and prev is None else good
-            R0, p0, _ = robust_mean(rot_w[pick], pos_w[pick])
-            how = f"{len(pick)} reliable frames"
-            # the glove reports a hold only under a firm grip: the object can still be in the hand, carried more
-            # lightly, after the glove's release (or before its onset); held until it is seen at rest
-            settled = good[np.linalg.norm(pos_w[good] - p0, axis=1) <= rest_tol]
-            if len(settled):
-                if prev is not None and settled[0] > s:
-                    hold_with(np.arange(s, settled[0]), prev[2], prev[3])
-                    report.append(f"held {s}-{settled[0] - 1} too (the object still away from its rest pose after the glove's release)")
-                    s = settled[0]
-                if nxt is not None and settled[-1] < e - 1:
-                    hold_with(np.arange(settled[-1] + 1, e), nxt[2], nxt[3])
-                    report.append(f"held {settled[-1] + 1}-{e - 1} too (the object already away from its rest pose before the glove's onset)")
-                    e = settled[-1] + 1
-        else:                                    # none seen: where the hand left it (or will take it)
-            k = s - 1 if s > 0 else e
-            if k >= T:                           # no hold at all: the tracked trajectory's first pose
-                R0, p0, how = rot_w[0], pos_w[0], "the tracked first frame"
+    mu, solves = 1.0, []
+    if anchor in ("rest", "contact"):
+        mesh_path = Path(reference).parent / "object_collision.obj"
+        if anchor == "contact":                      # the object is rescaled below: always from the unscaled meshes
+            for name in ("object_collision", "object_visual"):
+                orig = Path(reference).parent / f"{name}_unscaled.obj"
+                if orig.exists():
+                    orig.replace(Path(reference).parent / f"{name}.obj")
+        out_R, out_p, source, report, solves, mu, hand_shift = anchored_object_trajectory(
+            ref, pos_w, rot_w, reliable, side_holds, mesh_path, anchor, hand_fix=hand_fix)
+        if np.abs(hand_shift).max() > 0:
+            # the whole reference hand moved with it: palm, mocap joints, Wuji keypoints, virtual base
+            ref["wrist_pos"] = ref["wrist_pos"] + hand_shift
+            ref["human_kp"] = ref["human_kp"] + hand_shift[:, None]
+            ref["ref_keypoints"] = ref["ref_keypoints"] + hand_shift[:, None]
+            ref["base_q"] = base_coordinates(ref["base_R0"], ref["wrist_pos"], ref["wrist_rot"])
+            lift = clearance_lift(ref["human_kp"], ref["hand_valid"].astype(bool), clearance, "frame")
+            hand_shift = hand_shift + lift[:, None] * np.r_[0.0, 0.0, 1.0]
+            for k in ("wrist_pos",):
+                ref[k] = ref[k] + lift[:, None] * np.r_[0.0, 0.0, 1.0]
+            for k in ("human_kp", "ref_keypoints"):
+                ref[k] = ref[k] + lift[:, None, None] * np.r_[0.0, 0.0, 1.0]
+            ref["base_q"] = base_coordinates(ref["base_R0"], ref["wrist_pos"], ref["wrist_rot"])
+            ref["hand_dz"] = ref["hand_dz"] + hand_shift[:, 2]
+            ref["hand_contact_shift"] = hand_shift
+            report.append(f"then lifted {lift.max() * 100:.1f} cm max on {np.count_nonzero(lift > 1e-4)} frames to clear the table")
+            report.append(f"hand shifted {np.round(hand_shift.min(0) * 100, 1)}..{np.round(hand_shift.max(0) * 100, 1)} cm "
+                          f"(x, y, z), lowest mocap joint {ref['human_kp'][..., 2].min() * 100:.1f} cm above the table")
+        spreads, anchors = [], []
+        is_held = np.array([str(x).startswith("held") for x in source])
+        edges = []
+    else:
+        out_R, out_p = np.zeros((T, 3, 3)), np.zeros((T, 3))
+        source = np.array(["rest"] * T, dtype=object)
+        report, spreads, anchors = [], [], []
+        # held: the palm times one offset
+        Rp, pp = ref["wrist_rot"], ref["wrist_pos"]
+        for a, b in side_holds:
+            frames = np.arange(a, min(b, T))
+            good = frames[reliable[frames]]
+            how, spread = anchor, (np.nan, np.nan)
+            if anchor == "vision" and len(good) >= 5:
+                A_R = np.einsum("tji,tjk->tik", Rp[good], rot_w[good])                         # palm^T object
+                A_p = np.einsum("tji,tj->ti", Rp[good], pos_w[good] - pp[good])
+                R_off, p_off, spread = robust_mean(A_R, A_p)
+                spreads.append(spread)
+                if spread[0] > max_spread_deg or spread[1] * 100 > max_spread_cm:
+                    how = "tactile"                  # the video's offsets disagree: not a reliable view of the held object
+            if how != "vision":
+                if "grasp_R_palm" not in ref:
+                    raise SystemExit(f"hold {a}-{b}: {len(good)} reliable frames and no grasp pose (add_grasp_pose)")
+                R_off, p_off, how = ref["grasp_R_palm"], ref["grasp_p_palm"], "tactile"
+            out_R[frames] = np.einsum("tij,jk->tik", Rp[frames], R_off)
+            out_p[frames] = pp[frames] + np.einsum("tij,j->ti", Rp[frames], p_off)
+            source[frames] = f"held ({how})"
+            anchors.append((a, min(b, T), R_off, p_off))
+            seen = (f"the video's offsets on {len(good)} reliable frames spread {spread[0]:.0f} deg / {spread[1] * 100:.1f} cm"
+                    if np.isfinite(spread[0]) else f"{len(good)} reliable frames")
+            report.append(f"held {a}-{b - 1}: offset from {'the video' if how == 'vision' else 'the tactile grasp pose'} ({seen})")
+        # at rest: one pose per stretch between holds
+        held = source != "rest"
+        stretches, t = [], 0
+        while t < T:
+            if not held[t]:
+                s = t
+                while t < T and not held[t]:
+                    t += 1
+                stretches.append((s, t))
             else:
-                R0, p0, how = out_R[k], out_p[k], "the hand's pose at the boundary"
-        frames = np.arange(s, e)
-        out_R[frames], out_p[frames] = R0, p0
-        report.append(f"rest {s}-{e - 1}: one pose from {how}")
-    # blend at each grasp and release; how far the object jumps there (the rest pose against the held one)
-    is_held = np.array([str(x).startswith("held") for x in source])
-    edges = np.flatnonzero(np.diff(is_held.astype(int))) + 1
-    report.append("jumps blended over %d frames: %s" % (blend, ", ".join(
-        f"{np.linalg.norm(out_p[e] - out_p[e - 1]) * 100:.1f} cm at {e}" for e in edges)))
-    for edge in edges:
-        lo, hi = max(0, edge - blend // 2), min(T - 1, edge + blend // 2)
-        if hi - lo < 2:
-            continue
-        w = np.linspace(0, 1, hi - lo + 1)
-        ends = Rotation.from_matrix(np.stack([out_R[lo], out_R[hi]]))
-        out_R[lo:hi + 1] = slerp_matrices(ends, w)
-        out_p[lo:hi + 1] = out_p[lo] + w[:, None] * (out_p[hi] - out_p[lo])
+                t += 1
+        def hold_with(frames, R_off, p_off):
+            out_R[frames] = np.einsum("tij,jk->tik", Rp[frames], R_off)
+            out_p[frames] = pp[frames] + np.einsum("tij,j->ti", Rp[frames], p_off)
+            source[frames] = "held (extended)"
+
+        for s, e in stretches:
+            prev = next((h for h in anchors if h[1] == s), None)          # the hold ending where this stretch starts
+            nxt = next((h for h in anchors if h[0] == e), None)           # the hold starting where it ends
+            frames = np.arange(s, e)
+            good = frames[reliable[frames]]
+            if len(good) >= 3:
+                # the rest pose from where the object surely rests: away from the hand that brings or takes it
+                pick = good[-15:] if prev is not None and nxt is None else good[:15] if nxt is not None and prev is None else good
+                R0, p0, _ = robust_mean(rot_w[pick], pos_w[pick])
+                how = f"{len(pick)} reliable frames"
+                # the glove reports a hold only under a firm grip: the object can still be in the hand, carried more
+                # lightly, after the glove's release (or before its onset); held until it is seen at rest
+                settled = good[np.linalg.norm(pos_w[good] - p0, axis=1) <= rest_tol]
+                if len(settled):
+                    if prev is not None and settled[0] > s:
+                        hold_with(np.arange(s, settled[0]), prev[2], prev[3])
+                        report.append(f"held {s}-{settled[0] - 1} too (the object still away from its rest pose after the glove's release)")
+                        s = settled[0]
+                    if nxt is not None and settled[-1] < e - 1:
+                        hold_with(np.arange(settled[-1] + 1, e), nxt[2], nxt[3])
+                        report.append(f"held {settled[-1] + 1}-{e - 1} too (the object already away from its rest pose before the glove's onset)")
+                        e = settled[-1] + 1
+            else:                                    # none seen: where the hand left it (or will take it)
+                k = s - 1 if s > 0 else e
+                if k >= T:                           # no hold at all: the tracked trajectory's first pose
+                    R0, p0, how = rot_w[0], pos_w[0], "the tracked first frame"
+                else:
+                    R0, p0, how = out_R[k], out_p[k], "the hand's pose at the boundary"
+            frames = np.arange(s, e)
+            out_R[frames], out_p[frames] = R0, p0
+            report.append(f"rest {s}-{e - 1}: one pose from {how}")
+        # blend at each grasp and release; how far the object jumps there (the rest pose against the held one)
+        is_held = np.array([str(x).startswith("held") for x in source])
+        edges = np.flatnonzero(np.diff(is_held.astype(int))) + 1
+        report.append("jumps blended over %d frames: %s" % (blend, ", ".join(
+            f"{np.linalg.norm(out_p[e] - out_p[e - 1]) * 100:.1f} cm at {e}" for e in edges)))
+        for edge in edges:
+            lo, hi = max(0, edge - blend // 2), min(T - 1, edge + blend // 2)
+            if hi - lo < 2:
+                continue
+            w = np.linspace(0, 1, hi - lo + 1)
+            ends = Rotation.from_matrix(np.stack([out_R[lo], out_R[hi]]))
+            out_R[lo:hi + 1] = slerp_matrices(ends, w)
+            out_p[lo:hi + 1] = out_p[lo] + w[:, None] * (out_p[hi] - out_p[lo])
     # the frames the RL scores the object on
     measured = ~is_held.copy()
     for a, b, _, _ in anchors:
@@ -581,6 +864,18 @@ def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: 
     obj_margin_scale = np.where(strict, 1.0, held_margin)
     report.append(f"object target: {target} ({strict.sum()}/{T} frames strict"
                   + (f", the others weight {held_weight:g}, margins x {held_margin:g})" if target == "measured" else ")"))
+    if anchor == "contact" and abs(mu - 1) > 1e-6:
+        # the object mu times its size (the unscaled meshes kept: a run again starts from them), and its video
+        # poses carried along their camera rays by the same factor, for the evaluation's keyframes
+        for name in ("object_collision", "object_visual"):
+            path = Path(reference).parent / f"{name}.obj"
+            m = trimesh.load(path, force="mesh", process=False)
+            m.export(Path(reference).parent / f"{name}_unscaled.obj")
+            m.vertices = np.asarray(m.vertices) * mu
+            m.export(path)
+        c = ref["cam_pos"][:T]
+        pos_w = c + mu * (pos_w - c)
+        report.append(f"object scaled by mu {mu:.2f} (meshes, and the video poses along their rays)")
     # the frame-0 lift putting the object on the table, for the new rest pose
     V = np.asarray(trimesh.load(Path(reference).parent / "object_visual.obj", process=False).vertices)
     z0 = (V @ out_R[0].T + out_p[0])[:, 2].min()
@@ -594,7 +889,9 @@ def keyframe_object_trajectory(reference: Path, recon: Path, obj: str, episode: 
                obj_valid=np.ones(T, bool), obj_weight=obj_weight, obj_margin_scale=obj_margin_scale,
                obj_measured=measured, obj_target=target,
                obj_pos_measured=pos_w, obj_rot_measured=rot_w, obj_inliers=inl, obj_kf=kf, obj_rest_z=-z0, obj_traj_source=source.astype(str), obj_keyframes=reliable,
-               hold_offset_spread_deg=np.array([s[0] for s in spreads]), hold_offset_spread_cm=np.array([s[1] * 100 for s in spreads]))
+               hold_offset_spread_deg=np.array([s[0] for s in spreads]), hold_offset_spread_cm=np.array([s[1] * 100 for s in spreads]),
+               obj_anchor=anchor, obj_tracker=tracker, obj_contact_mu=mu,
+               obj_contact_solves=json.dumps([{k: v for k, v in x.items() if k not in ("R", "p")} for x in solves]))
     np.savez(reference, **ref)
 
 

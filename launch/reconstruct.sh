@@ -61,6 +61,8 @@
 #          HAND_PER_FRAME_DEPTH=0 (keep HaWoR's own per-frame depth)
 #          DEPTH=moge|da3 (step 3's depth model; video.json records it)
 #          MESH_MODEL=recgen|sam3d (step 7; video.json records it)  RECGEN_EROSION=1  SAM3_OFFLOAD=1  SMOOTH_WINDOW=9
+#          OBJECT_TRACKER=foundationpose (step 8b: also FoundationPose's trajectory, <object>_traj_foundationpose.npz,
+#          next to CoTracker's; PY_FP, FP_ROOT; SKIP_FP=1)
 #          HAND_CONTACT=1 (step 9)  CONTACT_ARGS="--touch-contacts 2 --finger-radius 0.01" (hand_object_contact.py)
 #          OBJECT_PROMPTS="a;b" (SAM3's prompts after OBJECT when its mask is empty; default the scene's description and
 #          the EgoTouch manifest's name)
@@ -293,6 +295,14 @@ if [ "${SKIP_OBJECT:-0}" != "1" ]; then
     "$PY_SIM" $R/compose_camera_motion.py --object-traj "$OBJ_TRAJ_CAM" --camera-traj "$CAMERA_TRAJ" \
         --intrinsics "$INTRINSICS_YAML" --out "$OBJ_TRAJ_COMPOSED"
     "$PY_SIM" $R/smooth_object_kalman.py --traj "$OBJ_TRAJ_COMPOSED" --mesh "$MESH" --out "$OBJ_TRAJ"
+fi
+if [ "${OBJECT_TRACKER:-cotracker}" = "foundationpose" ] && [ "${SKIP_FP:-0}" != "1" ]; then
+    echo "=== 8b object trajectory: FoundationPose on the RGB, the depth and the mesh (prepare_reference.py --object-poses foundationpose) ==="
+    in_env "$PY_FP" $R/track_object_foundationpose.py --recon "$OUT" --object "$OBJ_ID" --ref-frame "$n" --episode "$EP_DIR"
+    "$PY_SIM" $R/compose_camera_motion.py --object-traj "$OUT/${OBJ_ID}_traj_camera_foundationpose.npz" \
+        --camera-traj "$CAMERA_TRAJ" --intrinsics "$INTRINSICS_YAML" --out "$OUT/${OBJ_ID}_traj_composed_foundationpose.npz"
+    "$PY_SIM" $R/smooth_object_kalman.py --traj "$OUT/${OBJ_ID}_traj_composed_foundationpose.npz" --mesh "$MESH" \
+        --out "$OUT/${OBJ_ID}_traj_foundationpose.npz"
 fi
 if [ "${HAND_CONTACT:-0}" = "1" ]; then
     echo "=== 9 hands' depth from the glove's contacts with the object ==="
