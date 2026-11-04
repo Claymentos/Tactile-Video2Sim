@@ -1,0 +1,36 @@
+{
+  "os": "Linux-5.14.0-570.131.1.el9_6.x86_64-x86_64-with-glibc2.34",
+  "python": "CPython 3.12.13",
+  "startedAt": "2026-11-02T11:02:47.687371Z",
+  "args": [
+    "--group",
+    "obj1",
+    "outputs/episodes/obj1_references/et_pick_up_hammer_20260321_095958_211_rob1_rt07_reference.mp4=egotouch_pick_up_hammer_reference",
+    "outputs/episodes/obj1_references/et_pick_up_hammer_20260321_095941_028_rob1_rt07_reference.mp4=egotouch_pick_up_hammer_095941_reference",
+    "outputs/episodes/obj1_references/et_pick_up_wrench_20260321_094952_783_rob1_rt07_reference.mp4=egotouch_pick_up_wrench_reference",
+    "outputs/episodes/obj1_references/et_pick_up_screwdriver_20260321_103242_339_rob1_rt07_reference.mp4=egotouch_pick_up_screwdriver_reference"
+  ],
+  "program": "/lustre/fswork/projects/rech/iyg/uvx44rt/Tactile-Video2Sim/scripts/policy/upload_reference_videos.py",
+  "codePath": "scripts/policy/upload_reference_videos.py",
+  "codePathLocal": "scripts/policy/upload_reference_videos.py",
+  "git": {
+    "remote": "https://github.com/Claymentos/Tactile-Video2Sim.git",
+    "commit": "70ab0e45fe317eaf8c68fdac9edf062cd75a42bd"
+  },
+  "email": "clement.prigent@free.fr",
+  "root": "/lustre/fswork/projects/rech/iyg/uvx44rt/Tactile-Video2Sim",
+  "host": "jean-zay1",
+  "executable": "/lustre/fsn1/projects/rech/iyg/uvx44rt/venvs/genesis/bin/python",
+  "cpu_count": 40,
+  "cpu_count_logical": 80,
+  "disk": {
+    "/": {
+      "total": "390922461184",
+      "used": "89640206336"
+    }
+  },
+  "memory": {
+    "total": "201622290432"
+  },
+  "writerId": "u7nnlc2ngg3ydwglge4n1jiejg3rzrzz"
+}

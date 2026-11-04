@@ -64,7 +64,11 @@ def main() -> None:
     ap.add_argument("--start", choices=("first", "in_hand"), default="first")
     ap.add_argument("--height", type=int, default=300, help="panel height (px)")
     ap.add_argument("--out", default=str(REPO / "outputs" / "episodes"))
+    ap.add_argument("--frames", default=None, help="--reference: only frames A:B (the EGL read-back aborts after ~50 "
+                    "frames in one process on Jean Zay: launch/slurm/render_references.slurm renders 40-frame chunks)")
     args = ap.parse_args()
+    if args.frames and not args.reference:
+        ap.error("--frames needs --reference (a policy rollout must run from its start)")
 
     if args.reference:
         env_args = RlReconEnvArgs(data=ReferenceDataArgs(reference=args.reference))
@@ -98,7 +102,11 @@ def main() -> None:
     rec = {k: [] for k in ("t", "hand_dof", "palm_pos", "palm_quat", "object_pos", "object_quat", "tactile_pressure",
                            "e_wrist", "e_obj", "tac_f1")}
     frames_dir = Path(str(ref["frames_dir"]))
-    for t in range(start, env.T - 1):
+    t0, t1 = start, env.T - 1
+    if args.frames:
+        a, b = args.frames.split(":")
+        t0, t1 = max(start, int(a or start)), min(t1, int(b or t1))
+    for t in range(t0, t1):
         if args.reference:                                    # kinematic: everything on the reference
             env.t[:] = t
             env._reset_hands_and_objects(envs, torch.tensor([t], device=env.device))

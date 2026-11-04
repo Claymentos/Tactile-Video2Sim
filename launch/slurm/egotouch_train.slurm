@@ -23,7 +23,8 @@ export WANDB_PROJECT="${WANDB_PROJECT:-tactile-video2sim}" WANDB_RUN_GROUP="${WA
 FILTER='^profiling\|ast.Str\|Falling back to convex hull'
 # jobs starting together compiled Genesis' kernels into the same ~/.cache/quadrants and some then read a broken kernel
 # (episodes of 1 step, fingers 17 cm off): each job works on its own copy of the cache
-export QD_OFFLINE_CACHE_FILE_PATH="${JOBSCRATCH:-/tmp/$SLURM_JOB_ID}/quadrants"
+# (egotouch_train_multi.slurm runs several of these in one job and sets one per run)
+export QD_OFFLINE_CACHE_FILE_PATH="${QD_OFFLINE_CACHE_FILE_PATH:-${JOBSCRATCH:-/tmp/$SLURM_JOB_ID}/quadrants}"
 mkdir -p "$QD_OFFLINE_CACHE_FILE_PATH"
 cp -r "$HOME/.cache/quadrants/qdcache/." "$QD_OFFLINE_CACHE_FILE_PATH/" 2>/dev/null || true
 echo "=== $EXP on $(hostname) ($SLURM_JOB_ID): $REF ${EXTRA:-} ==="
